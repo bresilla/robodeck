@@ -37,6 +37,8 @@
             pkgs.binaryen
             pkgs.wasm-bindgen-cli
             pkgs.cacert
+          ] ++ pkgs.lib.optionals (pkgs ? zenohd) [
+            pkgs.zenohd
           ];
 
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";

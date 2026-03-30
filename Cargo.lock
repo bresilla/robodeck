@@ -2488,6 +2488,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "robodeck"
+version = "0.1.0"
+dependencies = [
+ "robo",
+ "tokio",
+]
+
+[[package]]
 name = "ron"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3625,14 +3633,6 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "spin 0.10.0",
-]
-
-[[package]]
-name = "uimap"
-version = "0.1.0"
-dependencies = [
- "robo",
- "tokio",
 ]
 
 [[package]]
