@@ -347,6 +347,15 @@ textarea {
   z-index: 4;
 }
 
+.top-mode-switch {
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+  z-index: 4;
+}
+
 .left-panels {
   left: 70px;
 }

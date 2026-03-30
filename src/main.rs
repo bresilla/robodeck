@@ -134,6 +134,7 @@ enum LeftPanel {
     Reference,
     Zones,
     Graph,
+    Robots,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +142,12 @@ enum RightPanel {
     Details,
     Json,
     Files,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppMode {
+    Editor,
+    Management,
 }
 
 fn main() {
@@ -151,6 +158,7 @@ fn main() {
 #[component]
 fn App() -> impl IntoView {
     let workspace = RwSignal::new(WorkspaceJson::default());
+    let app_mode = RwSignal::new(AppMode::Editor);
     let selection = RwSignal::new(Selection::Workspace);
     let mode = RwSignal::new(Mode::Inspect);
     let edge_source_id = RwSignal::new(String::new());
@@ -162,6 +170,8 @@ fn App() -> impl IntoView {
     let pending_zone_parent = RwSignal::new(None::<String>);
     let active_left_panel = RwSignal::new(Some(LeftPanel::Zones));
     let active_right_panel = RwSignal::new(Some(RightPanel::Files));
+    let management_left_panel = RwSignal::new(Some(LeftPanel::Robots));
+    let management_right_panel = RwSignal::new(Some(RightPanel::Details));
     let status = RwSignal::new(String::from("Ready. Add a root zone or paste workspace JSON."));
     let raw_json = RwSignal::new(
         serde_json::to_string_pretty(&workspace.get()).unwrap_or_else(|_| "{}".into()),
@@ -187,6 +197,7 @@ fn App() -> impl IntoView {
             let _ = bind_map_interactions(
                 &map,
                 workspace,
+                app_mode,
                 selection,
                 mode,
                 edge_source_id,
@@ -217,6 +228,7 @@ fn App() -> impl IntoView {
         let preview_point = preview_mouse_point.get();
         let zone_draft = zone_draft_points.get();
         let dragging = marker_dragging.get();
+        let current_app_mode = app_mode.get();
         let _ = map_view_tick.get();
         MAP_HANDLE.with(|cell| {
             if let Some(map) = cell.borrow().as_ref() {
@@ -232,7 +244,7 @@ fn App() -> impl IntoView {
                         preview_point.as_ref(),
                         &zone_draft,
                     );
-                    if !dragging {
+                    if current_app_mode == AppMode::Editor && !dragging {
                         let _ = render_markers(
                             map,
                             workspace,
@@ -244,6 +256,8 @@ fn App() -> impl IntoView {
                             status,
                             marker_dragging,
                         );
+                    } else if current_app_mode != AppMode::Editor {
+                        clear_markers();
                     }
                 }
             }
@@ -254,6 +268,20 @@ fn App() -> impl IntoView {
         if mode.get() != Mode::PlaceZone && !zone_draft_points.with(|points| points.is_empty()) {
             zone_draft_points.set(Vec::new());
         }
+    });
+
+    Effect::new(move |_| {
+        if app_mode.get() == AppMode::Editor {
+            return;
+        }
+        mode.set(Mode::Inspect);
+        edge_source_id.set(String::new());
+        preview_mouse_point.set(None);
+        zone_draft_points.set(Vec::new());
+        pending_zone_parent.set(None);
+        scene_drag.set(None);
+        marker_dragging.set(false);
+        clear_markers();
     });
 
     let sync_json = move || {
@@ -298,6 +326,16 @@ fn App() -> impl IntoView {
         update_workspace("Removed edge.", false);
     };
 
+    let switch_to_editor = move |_| {
+        app_mode.set(AppMode::Editor);
+        status.set("Editor mode.".into());
+    };
+
+    let switch_to_management = move |_| {
+        app_mode.set(AppMode::Management);
+        status.set("Management mode. Fleet tools are not implemented yet.".into());
+    };
+
     let toggle_left_panel = move |panel: LeftPanel| {
         active_left_panel.update(|active| {
             *active = if *active == Some(panel) {
@@ -310,6 +348,26 @@ fn App() -> impl IntoView {
 
     let toggle_right_panel = move |panel: RightPanel| {
         active_right_panel.update(|active| {
+            *active = if *active == Some(panel) {
+                None
+            } else {
+                Some(panel)
+            };
+        });
+    };
+
+    let toggle_management_left_panel = move |panel: LeftPanel| {
+        management_left_panel.update(|active| {
+            *active = if *active == Some(panel) {
+                None
+            } else {
+                Some(panel)
+            };
+        });
+    };
+
+    let toggle_management_right_panel = move |panel: RightPanel| {
+        management_right_panel.update(|active| {
             *active = if *active == Some(panel) {
                 None
             } else {
@@ -384,36 +442,52 @@ fn App() -> impl IntoView {
                         </div>
 
                         <div class="floating left-stack">
-                            <button
-                                class="panel-toggle"
-                                class:is-active=move || active_left_panel.get() == Some(LeftPanel::Reference)
-                                on:click=move |_| toggle_left_panel(LeftPanel::Reference)
-                                type="button"
-                                title="Toggle reference panel"
+                            <Show
+                                when=move || app_mode.get() == AppMode::Editor
+                                fallback=move || view! {
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || management_left_panel.get() == Some(LeftPanel::Robots)
+                                        on:click=move |_| toggle_management_left_panel(LeftPanel::Robots)
+                                        type="button"
+                                        title="Toggle robots panel"
+                                    >
+                                        "R"
+                                    </button>
+                                }
                             >
-                                "R"
-                            </button>
-                            <button
-                                class="panel-toggle"
-                                class:is-active=move || active_left_panel.get() == Some(LeftPanel::Zones)
-                                on:click=move |_| toggle_left_panel(LeftPanel::Zones)
-                                type="button"
-                                title="Toggle zones panel"
-                            >
-                                "Z"
-                            </button>
-                            <button
-                                class="panel-toggle"
-                                class:is-active=move || active_left_panel.get() == Some(LeftPanel::Graph)
-                                on:click=move |_| toggle_left_panel(LeftPanel::Graph)
-                                type="button"
-                                title="Toggle graph panel"
-                            >
-                                "G"
-                            </button>
+                                <button
+                                    class="panel-toggle"
+                                    class:is-active=move || active_left_panel.get() == Some(LeftPanel::Reference)
+                                    on:click=move |_| toggle_left_panel(LeftPanel::Reference)
+                                    type="button"
+                                    title="Toggle reference panel"
+                                >
+                                    "R"
+                                </button>
+                                <button
+                                    class="panel-toggle"
+                                    class:is-active=move || active_left_panel.get() == Some(LeftPanel::Zones)
+                                    on:click=move |_| toggle_left_panel(LeftPanel::Zones)
+                                    type="button"
+                                    title="Toggle zones panel"
+                                >
+                                    "Z"
+                                </button>
+                                <button
+                                    class="panel-toggle"
+                                    class:is-active=move || active_left_panel.get() == Some(LeftPanel::Graph)
+                                    on:click=move |_| toggle_left_panel(LeftPanel::Graph)
+                                    type="button"
+                                    title="Toggle graph panel"
+                                >
+                                    "G"
+                                </button>
+                            </Show>
                         </div>
 
                         <div class="floating left-panels">
+                            <Show when=move || app_mode.get() == AppMode::Editor>
                             <section
                                 class="card floating-panel left-panel-card"
                                 class:is-hidden=move || active_left_panel.get() != Some(LeftPanel::Reference)
@@ -733,39 +807,94 @@ fn App() -> impl IntoView {
                                     </Show>
                                 </div>
                             </section>
+                            </Show>
+
+                            <Show when=move || app_mode.get() == AppMode::Management>
+                                <section
+                                    class="card floating-panel left-panel-card"
+                                    class:is-hidden=move || management_left_panel.get() != Some(LeftPanel::Robots)
+                                >
+                                    <div class="panel-head">
+                                        <div>
+                                            <p class="section">"Fleet"</p>
+                                            <h3>"Robots"</h3>
+                                        </div>
+                                    </div>
+                                    <div class="list empty">
+                                        <p class="empty-copy">"Robots management is not implemented yet."</p>
+                                    </div>
+                                </section>
+                            </Show>
+                        </div>
+
+                        <div class="floating top-mode-switch">
+                            <button
+                                class="panel-toggle"
+                                class:is-active=move || app_mode.get() == AppMode::Editor
+                                on:click=switch_to_editor
+                                type="button"
+                                title="Editor"
+                            >
+                                "E"
+                            </button>
+                            <button
+                                class="panel-toggle"
+                                class:is-active=move || app_mode.get() == AppMode::Management
+                                on:click=switch_to_management
+                                type="button"
+                                title="Management"
+                            >
+                                "M"
+                            </button>
                         </div>
 
                         <div class="floating right-panel-shell">
                             <div class="right-stack">
-                                <button
-                                    class="panel-toggle"
-                                    class:is-active=move || active_right_panel.get() == Some(RightPanel::Details)
-                                    on:click=move |_| toggle_right_panel(RightPanel::Details)
-                                    type="button"
-                                    title="Toggle inspector panel"
+                                <Show
+                                    when=move || app_mode.get() == AppMode::Editor
+                                    fallback=move || view! {
+                                        <button
+                                            class="panel-toggle"
+                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Details)
+                                            on:click=move |_| toggle_management_right_panel(RightPanel::Details)
+                                            type="button"
+                                            title="Toggle inspector panel"
+                                        >
+                                            "I"
+                                        </button>
+                                    }
                                 >
-                                    "I"
-                                </button>
-                                <button
-                                    class="panel-toggle"
-                                    class:is-active=move || active_right_panel.get() == Some(RightPanel::Json)
-                                    on:click=move |_| toggle_right_panel(RightPanel::Json)
-                                    type="button"
-                                    title="Toggle raw json panel"
-                                >
-                                    "J"
-                                </button>
-                                <button
-                                    class="panel-toggle"
-                                    class:is-active=move || active_right_panel.get() == Some(RightPanel::Files)
-                                    on:click=move |_| toggle_right_panel(RightPanel::Files)
-                                    type="button"
-                                    title="Toggle files panel"
-                                >
-                                    "F"
-                                </button>
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || active_right_panel.get() == Some(RightPanel::Details)
+                                        on:click=move |_| toggle_right_panel(RightPanel::Details)
+                                        type="button"
+                                        title="Toggle inspector panel"
+                                    >
+                                        "I"
+                                    </button>
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || active_right_panel.get() == Some(RightPanel::Json)
+                                        on:click=move |_| toggle_right_panel(RightPanel::Json)
+                                        type="button"
+                                        title="Toggle raw json panel"
+                                    >
+                                        "J"
+                                    </button>
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || active_right_panel.get() == Some(RightPanel::Files)
+                                        on:click=move |_| toggle_right_panel(RightPanel::Files)
+                                        type="button"
+                                        title="Toggle files panel"
+                                    >
+                                        "F"
+                                    </button>
+                                </Show>
                             </div>
                             <div class="right-panels">
+                                <Show when=move || app_mode.get() == AppMode::Editor>
                                 <section
                                     class="card floating-panel right-panel-card"
                                     class:is-hidden=move || active_right_panel.get() != Some(RightPanel::Details)
@@ -894,6 +1023,24 @@ fn App() -> impl IntoView {
                                         on:input=move |ev| raw_json.set(event_target_value(&ev))
                                     />
                                 </section>
+                                </Show>
+
+                                <Show when=move || app_mode.get() == AppMode::Management>
+                                    <section
+                                        class="card floating-panel right-panel-card"
+                                        class:is-hidden=move || management_right_panel.get() != Some(RightPanel::Details)
+                                    >
+                                        <div class="panel-head">
+                                            <div>
+                                                <p class="section">"Inspector"</p>
+                                                <h3>"Fleet"</h3>
+                                            </div>
+                                        </div>
+                                        <div class="inspector-stack">
+                                            <p class="hint">"Fleet management is not implemented yet."</p>
+                                        </div>
+                                    </section>
+                                </Show>
                             </div>
                         </div>
                     </div>
@@ -3026,6 +3173,7 @@ fn offset_from_direction(origin: &JsonPoint, from: &JsonPoint, to: &JsonPoint, f
 fn bind_map_interactions(
     map: &JsValue,
     workspace: RwSignal<WorkspaceJson>,
+    app_mode: RwSignal<AppMode>,
     selection: RwSignal<Selection>,
     mode: RwSignal<Mode>,
     edge_source_id: RwSignal<String>,
@@ -3095,7 +3243,7 @@ fn bind_map_interactions(
     })?;
     attach_map_layer_event(map, "mousedown", "node-circle", {
         move |event| {
-            if mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
+            if app_mode.get() != AppMode::Editor || mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
                 return;
             }
             let Some(id) = first_feature_id(&event) else {
@@ -3109,7 +3257,7 @@ fn bind_map_interactions(
     })?;
     attach_map_layer_event(map, "mousedown", "node-hit", {
         move |event| {
-            if mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
+            if app_mode.get() != AppMode::Editor || mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
                 return;
             }
             let Some(id) = first_feature_id(&event) else {
@@ -3123,7 +3271,7 @@ fn bind_map_interactions(
     })?;
     attach_map_layer_event(map, "mousedown", "selected-zone-fill", {
         move |event| {
-            if mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
+            if app_mode.get() != AppMode::Editor || mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
                 return;
             }
             let Some(zone_id) = first_feature_id(&event) else {
@@ -3141,7 +3289,7 @@ fn bind_map_interactions(
     attach_map_layer_event(map, "mousedown", "selected-zone-line", {
         let map = map.clone();
         move |event| {
-            if mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
+            if app_mode.get() != AppMode::Editor || mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
                 return;
             }
             let Some(zone_id) = first_feature_id(&event) else {
@@ -3165,7 +3313,7 @@ fn bind_map_interactions(
     attach_map_layer_event(map, "mousedown", "selected-zone-hit", {
         let map = map.clone();
         move |event| {
-            if mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
+            if app_mode.get() != AppMode::Editor || mode.get() != Mode::Inspect || event_button(&event) != Some(0) {
                 return;
             }
             let Some(zone_id) = first_feature_id(&event) else {
@@ -3212,6 +3360,10 @@ fn bind_map_interactions(
     })?;
 
     attach_map_event(map, "mousemove", move |event| {
+        if app_mode.get() != AppMode::Editor {
+            preview_mouse_point.set(None);
+            return;
+        }
         if let Some(point) = point_from_map_event(&event) {
             match scene_drag.get() {
                 Some(SceneDrag::Node(node_id)) => {
@@ -3277,6 +3429,9 @@ fn bind_map_interactions(
     attach_map_event(map, "click", {
         let map = map.clone();
         move |event| {
+            if app_mode.get() != AppMode::Editor {
+                return;
+            }
             if scene_drag.get().is_some() {
                 return;
             }
@@ -3377,6 +3532,9 @@ fn bind_map_interactions(
     attach_map_event(map, "contextmenu", {
         let map = map.clone();
         move |event| {
+            if app_mode.get() != AppMode::Editor {
+                return;
+            }
             if mode.get() == Mode::PlaceZone {
                 finish_zone_draft(
                     workspace,
