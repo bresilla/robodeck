@@ -1,6 +1,6 @@
 [build]
-target = "index.html"
+target = "deck/index.html"
 dist = "dist"
 
 [watch]
-watch = ["src", "index.html", "Cargo.toml"]
+watch = ["deck/src", "deck/index.html", "deck/Cargo.toml"]
