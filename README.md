@@ -111,6 +111,32 @@ This allows the same graph structure to be associated with the semantic zone hie
 
 ## Run
 
+Build the frontend and run the single server binary:
+
 ```bash
-trunk serve
+make serve
+```
+
+Or, if you want the explicit two-step form:
+
+```bash
+trunk build
+cargo run --bin robodeck
+```
+
+Then open:
+
+```text
+http://127.0.0.1:38080
+```
+
+The single Rust server serves the built frontend from `dist/` and also exposes
+the Zenoh API at `/api/zenoh`. The browser talks to the same process that owns
+the Zenoh session, so runtime is one binary instead of a separate frontend and
+backend server.
+
+If you still want the old frontend-only dev server, use:
+
+```bash
+make serve-ui
 ```

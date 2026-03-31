@@ -4,7 +4,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
-use web_sys::{Event, FileReader, HtmlAnchorElement, HtmlElement, HtmlInputElement, MouseEvent, ProgressEvent};
+use wasm_bindgen_futures::{spawn_local, JsFuture};
+use web_sys::{
+    Event, FileReader, HtmlAnchorElement, HtmlElement, HtmlInputElement, MouseEvent, ProgressEvent,
+    Request, RequestInit, Response,
+};
 
 thread_local! {
     static MAP_HANDLE: RefCell<Option<JsValue>> = const { RefCell::new(None) };
@@ -142,12 +146,99 @@ enum RightPanel {
     Details,
     Json,
     Files,
+    Zenoh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppMode {
     Editor,
     Management,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ZenohConnectionType {
+    Ws,
+    Tcp,
+    Udp,
+    Quic,
+}
+
+impl ZenohConnectionType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ws => "ws",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Quic => "quic",
+        }
+    }
+
+    fn from_value(value: &str) -> Self {
+        match value {
+            "tcp" => Self::Tcp,
+            "udp" => Self::Udp,
+            "quic" => Self::Quic,
+            _ => Self::Ws,
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Ws => "WebSocket",
+            Self::Tcp => "TCP",
+            Self::Udp => "UDP",
+            Self::Quic => "QUIC",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ZenohConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ZenohConnectRequest {
+    endpoint: String,
+    connection_type: ZenohConnectionType,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ZenohStatusResponse {
+    state: ZenohConnectionState,
+    endpoint: String,
+    connection_type: ZenohConnectionType,
+    status: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+struct RobotSummary {
+    name: String,
+    odom_key: String,
+    gnss_keys: Vec<String>,
+    gnss_lat: Option<f64>,
+    gnss_lon: Option<f64>,
+    odom_x: Option<f64>,
+    odom_y: Option<f64>,
+    yaw_rad: Option<f64>,
+    last_seen_ms: u64,
+}
+
+impl Default for ZenohConnectionType {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
+impl Default for ZenohConnectionState {
+    fn default() -> Self {
+        Self::Disconnected
+    }
 }
 
 fn main() {
@@ -171,11 +262,17 @@ fn App() -> impl IntoView {
     let active_left_panel = RwSignal::new(Some(LeftPanel::Zones));
     let active_right_panel = RwSignal::new(Some(RightPanel::Files));
     let management_left_panel = RwSignal::new(Some(LeftPanel::Robots));
-    let management_right_panel = RwSignal::new(Some(RightPanel::Details));
+    let management_right_panel = RwSignal::new(Some(RightPanel::Zenoh));
     let status = RwSignal::new(String::from("Ready. Add a root zone or paste workspace JSON."));
     let raw_json = RwSignal::new(
         serde_json::to_string_pretty(&workspace.get()).unwrap_or_else(|_| "{}".into()),
     );
+    let zenoh_endpoint = RwSignal::new(String::from("localhost:7447"));
+    let zenoh_connection_type = RwSignal::new(ZenohConnectionType::Tcp);
+    let zenoh_state = RwSignal::new(ZenohConnectionState::Disconnected);
+    let zenoh_status = RwSignal::new(String::from("Not connected."));
+    let robots = RwSignal::new(Vec::<RobotSummary>::new());
+    let robot_clock_ms = RwSignal::new(now_ms());
     let map_host = NodeRef::<leptos::html::Div>::new();
     let map_initialized = RwSignal::new(false);
     let map_view_tick = RwSignal::new(0_u64);
@@ -229,6 +326,8 @@ fn App() -> impl IntoView {
         let zone_draft = zone_draft_points.get();
         let dragging = marker_dragging.get();
         let current_app_mode = app_mode.get();
+        let now_ms = robot_clock_ms.get();
+        let robot_state = visible_robots(&robots.get(), now_ms);
         let _ = map_view_tick.get();
         MAP_HANDLE.with(|cell| {
             if let Some(map) = cell.borrow().as_ref() {
@@ -256,6 +355,8 @@ fn App() -> impl IntoView {
                             status,
                             marker_dragging,
                         );
+                    } else if current_app_mode == AppMode::Management {
+                        let _ = render_robot_markers(map, &ws, &robot_state);
                     } else if current_app_mode != AppMode::Editor {
                         clear_markers();
                     }
@@ -333,7 +434,7 @@ fn App() -> impl IntoView {
 
     let switch_to_management = move |_| {
         app_mode.set(AppMode::Management);
-        status.set("Management mode. Fleet tools are not implemented yet.".into());
+        status.set("Management mode. Zenoh connection controls are available on the right.".into());
     };
 
     let toggle_left_panel = move |panel: LeftPanel| {
@@ -428,6 +529,99 @@ fn App() -> impl IntoView {
     let graph_nodes = move || workspace.with(|ws| ws.nodes.values().cloned().collect::<Vec<_>>());
     let graph_edges = move || workspace.with(|ws| ws.edges.values().cloned().collect::<Vec<_>>());
     let validation = move || validation_messages(&workspace.get());
+
+    {
+        let poll_state = zenoh_state;
+        let poll_status = zenoh_status;
+        let poll_endpoint = zenoh_endpoint;
+        let poll_type = zenoh_connection_type;
+        let poll_robots = robots;
+        let robot_clock = robot_clock_ms;
+        let app_status = status;
+        Effect::new(move |_| {
+            spawn_local(refresh_zenoh_status(
+                poll_state,
+                poll_status,
+                poll_endpoint,
+                poll_type,
+                app_status,
+                false,
+            ));
+            spawn_local(refresh_robots(poll_robots));
+            robot_clock.set(now_ms());
+
+            let callback = Closure::<dyn FnMut()>::wrap(Box::new(move || {
+                spawn_local(refresh_zenoh_status(
+                    poll_state,
+                    poll_status,
+                    poll_endpoint,
+                    poll_type,
+                    app_status,
+                    false,
+                ));
+                spawn_local(refresh_robots(poll_robots));
+                robot_clock.set(now_ms());
+            }));
+
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                    callback.as_ref().unchecked_ref(),
+                    2000,
+                );
+            }
+
+            callback.forget();
+        });
+    }
+
+    let connect_zenoh = move |_: MouseEvent| {
+        let endpoint = zenoh_endpoint.get().trim().to_string();
+        let connection_type = zenoh_connection_type.get();
+
+        if endpoint.is_empty() {
+            zenoh_state.set(ZenohConnectionState::Error);
+            zenoh_status.set("Enter a Zenoh endpoint first.".into());
+            status.set("Zenoh endpoint is missing.".into());
+            return;
+        }
+
+        zenoh_state.set(ZenohConnectionState::Connecting);
+        zenoh_status.set(format!(
+            "Connecting to {} via {}...",
+            endpoint,
+            connection_type.display_name()
+        ));
+        status.set(format!(
+            "Requesting Rust backend Zenoh connection to {} via {}...",
+            endpoint,
+            connection_type.display_name()
+        ));
+
+        spawn_local(connect_zenoh_api(
+            ZenohConnectRequest {
+                endpoint,
+                connection_type,
+            },
+            zenoh_state,
+            zenoh_status,
+            zenoh_endpoint,
+            zenoh_connection_type,
+            status,
+        ));
+    };
+
+    let disconnect_zenoh = move |_: MouseEvent| {
+        zenoh_state.set(ZenohConnectionState::Connecting);
+        zenoh_status.set("Disconnecting...".into());
+        status.set("Requesting Rust backend Zenoh disconnect...".into());
+        spawn_local(disconnect_zenoh_api(
+            zenoh_state,
+            zenoh_status,
+            zenoh_endpoint,
+            zenoh_connection_type,
+            status,
+        ));
+    };
 
     view! {
         <div class="shell">
@@ -820,8 +1014,26 @@ fn App() -> impl IntoView {
                                             <h3>"Robots"</h3>
                                         </div>
                                     </div>
-                                    <div class="list empty">
-                                        <p class="empty-copy">"Robots management is not implemented yet."</p>
+                                    <div class="list" class:empty=move || robots.get().is_empty()>
+                                        <Show
+                                            when=move || !robots.get().is_empty()
+                                            fallback=move || view! {
+                                                <p class="empty-copy">"No robot odom or gnss topics detected yet."</p>
+                                            }
+                                        >
+                                            <For
+                                                each=move || visible_robots(&robots.get(), robot_clock_ms.get())
+                                                key=|robot| robot.name.clone()
+                                                let:robot
+                                            >
+                                                <RobotFleetRow
+                                                    robot=robot
+                                                    workspace=workspace
+                                                    status=status
+                                                    robot_clock_ms=robot_clock_ms
+                                                />
+                                            </For>
+                                        </Show>
                                     </div>
                                 </section>
                             </Show>
@@ -861,6 +1073,15 @@ fn App() -> impl IntoView {
                                             title="Toggle inspector panel"
                                         >
                                             "I"
+                                        </button>
+                                        <button
+                                            class="panel-toggle"
+                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Zenoh)
+                                            on:click=move |_| toggle_management_right_panel(RightPanel::Zenoh)
+                                            type="button"
+                                            title="Toggle Zenoh panel"
+                                        >
+                                            "Z"
                                         </button>
                                     }
                                 >
@@ -1038,6 +1259,90 @@ fn App() -> impl IntoView {
                                         </div>
                                         <div class="inspector-stack">
                                             <p class="hint">"Fleet management is not implemented yet."</p>
+                                        </div>
+                                    </section>
+
+                                    <section
+                                        class="card floating-panel right-panel-card"
+                                        class:is-hidden=move || management_right_panel.get() != Some(RightPanel::Zenoh)
+                                    >
+                                        <div class="panel-head panel-head-stack">
+                                            <div>
+                                                <p class="section">"Zenoh"</p>
+                                                <h3>"Connection"</h3>
+                                            </div>
+                                            <div
+                                                class="connection-pill"
+                                                class:is-connected=move || zenoh_state.get() == ZenohConnectionState::Connected
+                                                class:is-pending=move || zenoh_state.get() == ZenohConnectionState::Connecting
+                                            >
+                                                {move || {
+                                                    match zenoh_state.get() {
+                                                        ZenohConnectionState::Disconnected => "Disconnected",
+                                                        ZenohConnectionState::Connecting => "Connecting",
+                                                        ZenohConnectionState::Connected => "Connected",
+                                                        ZenohConnectionState::Error => "Error",
+                                                    }
+                                                }}
+                                            </div>
+                                        </div>
+                                        <div class="field-group">
+                                            <label class="field">
+                                                <span>"Connection"</span>
+                                                <input
+                                                    placeholder="localhost:7447"
+                                                    prop:value=move || zenoh_endpoint.get()
+                                                    on:input=move |ev| zenoh_endpoint.set(event_target_value(&ev))
+                                                />
+                                            </label>
+                                            <label class="field">
+                                                <span>"Connection Type"</span>
+                                                <select
+                                                    prop:value=move || zenoh_connection_type.get().as_str()
+                                                    on:change=move |ev| {
+                                                        zenoh_connection_type.set(ZenohConnectionType::from_value(&event_target_value(&ev)));
+                                                    }
+                                                >
+                                                    <option value="ws">"WebSocket"</option>
+                                                    <option value="tcp">"TCP"</option>
+                                                    <option value="udp">"UDP"</option>
+                                                    <option value="quic">"QUIC"</option>
+                                                </select>
+                                            </label>
+                                        </div>
+                                        <div class="panel-card">
+                                            <div class="panel-head compact-head">
+                                                <div>
+                                                    <p class="section">"Status"</p>
+                                                    <h3>"Session"</h3>
+                                                </div>
+                                            </div>
+                                            <p class="hint">
+                                                {move || zenoh_status.get()}
+                                            </p>
+                                            <p class="hint">
+                                                {move || {
+                                                    format!(
+                                                        "The Rust backend owns the Zenoh session and reports connection state back to this tab over the local API."
+                                                    )
+                                                }}
+                                            </p>
+                                        </div>
+                                        <div class="dock-actions">
+                                            <button
+                                                class="primary"
+                                                on:click=connect_zenoh
+                                                type="button"
+                                            >
+                                                "Connect"
+                                            </button>
+                                            <button
+                                                class="ghost"
+                                                on:click=disconnect_zenoh
+                                                type="button"
+                                            >
+                                                "Disconnect"
+                                            </button>
                                         </div>
                                     </section>
                                 </Show>
@@ -1269,6 +1574,70 @@ fn ZoneTreeNode(
             </li>
         }
         .into_any()
+    }
+}
+
+#[component]
+fn RobotFleetRow(
+    robot: RobotSummary,
+    workspace: RwSignal<WorkspaceJson>,
+    status: RwSignal<String>,
+    robot_clock_ms: RwSignal<u64>,
+) -> impl IntoView {
+    let robot_name = robot.name.clone();
+    let row_meta = {
+        let mut parts = Vec::new();
+        if !robot.odom_key.is_empty() {
+            parts.push(format!("odom: {}", robot.odom_key));
+        }
+        if !robot.gnss_keys.is_empty() {
+            parts.push(format!("gnss: {}", robot.gnss_keys.join(", ")));
+        }
+        if parts.is_empty() {
+            "No odom or gnss keys yet.".to_string()
+        } else {
+            parts.join(" | ")
+        }
+    };
+    let robot_color = robot_color(&robot.name);
+
+    let focus_robot = {
+        let robot = robot.clone();
+        move |_| {
+            let ws = workspace.get();
+            if let Some(point) = robot_point(&ws, &robot) {
+                MAP_HANDLE.with(|cell| {
+                    if let Some(map) = cell.borrow().as_ref() {
+                        let _ = focus_map_point(map, &point, 18.0);
+                    }
+                });
+                status.set(format!("Focused robot {}.", robot.name));
+            } else {
+                status.set(format!(
+                    "Robot {} has no mappable odom or gnss position yet.",
+                    robot.name
+                ));
+            }
+        }
+    };
+
+    view! {
+        <button
+            class="list-row"
+            class:is-stale=move || is_robot_stale(&robot, robot_clock_ms.get())
+            type="button"
+            on:click=focus_robot
+        >
+            <div class="row-main">
+                <p class="row-title">{robot_name}</p>
+                <p class="row-meta">{row_meta}</p>
+            </div>
+            <span
+                class="row-tail-action row-tail-color"
+                style:background-color=robot_color
+                title="Robot color"
+            ></span>
+        </button>
     }
 }
 
@@ -2510,6 +2879,247 @@ fn sync_raw_json(workspace: RwSignal<WorkspaceJson>, raw_json: RwSignal<String>)
 fn sync_workspace_state(workspace: RwSignal<WorkspaceJson>, raw_json: RwSignal<String>) {
     sync_associations(&workspace);
     sync_raw_json(workspace, raw_json);
+}
+
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
+}
+
+fn visible_robots(robots: &[RobotSummary], now_ms: u64) -> Vec<RobotSummary> {
+    robots
+        .iter()
+        .filter(|robot| now_ms.saturating_sub(robot.last_seen_ms) < 20_000)
+        .cloned()
+        .collect()
+}
+
+fn is_robot_stale(robot: &RobotSummary, now_ms: u64) -> bool {
+    now_ms.saturating_sub(robot.last_seen_ms) >= 5_000
+}
+
+fn robot_color(name: &str) -> String {
+    const PALETTE: [&str; 10] = [
+        "#e07a4d",
+        "#7ec7dc",
+        "#8ff0ae",
+        "#f3c96b",
+        "#ff8fab",
+        "#9bdeac",
+        "#6ea8fe",
+        "#f28482",
+        "#84dcc6",
+        "#cdb4db",
+    ];
+
+    let mut hash = 0_u64;
+    for byte in name.bytes() {
+        hash = hash.wrapping_mul(131).wrapping_add(u64::from(byte));
+    }
+
+    PALETTE[(hash as usize) % PALETTE.len()].to_string()
+}
+
+async fn refresh_zenoh_status(
+    zenoh_state: RwSignal<ZenohConnectionState>,
+    zenoh_status: RwSignal<String>,
+    zenoh_endpoint: RwSignal<String>,
+    zenoh_connection_type: RwSignal<ZenohConnectionType>,
+    app_status: RwSignal<String>,
+    update_app_status: bool,
+) {
+    if let Ok(response) = zenoh_status_api().await {
+        apply_zenoh_status_response(
+            response,
+            zenoh_state,
+            zenoh_status,
+            zenoh_endpoint,
+            zenoh_connection_type,
+            app_status,
+            update_app_status,
+        );
+    }
+}
+
+async fn refresh_robots(robots: RwSignal<Vec<RobotSummary>>) {
+    if let Ok(next) = robots_api().await {
+        robots.set(next);
+    }
+}
+
+async fn connect_zenoh_api(
+    request: ZenohConnectRequest,
+    zenoh_state: RwSignal<ZenohConnectionState>,
+    zenoh_status: RwSignal<String>,
+    zenoh_endpoint: RwSignal<String>,
+    zenoh_connection_type: RwSignal<ZenohConnectionType>,
+    app_status: RwSignal<String>,
+) {
+    match zenoh_connect_request(request).await {
+        Ok(response) => apply_zenoh_status_response(
+            response,
+            zenoh_state,
+            zenoh_status,
+            zenoh_endpoint,
+            zenoh_connection_type,
+            app_status,
+            true,
+        ),
+        Err(error) => {
+            zenoh_state.set(ZenohConnectionState::Error);
+            zenoh_status.set(error.clone());
+            app_status.set(error);
+        }
+    }
+}
+
+async fn disconnect_zenoh_api(
+    zenoh_state: RwSignal<ZenohConnectionState>,
+    zenoh_status: RwSignal<String>,
+    zenoh_endpoint: RwSignal<String>,
+    zenoh_connection_type: RwSignal<ZenohConnectionType>,
+    app_status: RwSignal<String>,
+) {
+    match zenoh_disconnect_request().await {
+        Ok(response) => apply_zenoh_status_response(
+            response,
+            zenoh_state,
+            zenoh_status,
+            zenoh_endpoint,
+            zenoh_connection_type,
+            app_status,
+            true,
+        ),
+        Err(error) => {
+            zenoh_state.set(ZenohConnectionState::Error);
+            zenoh_status.set(error.clone());
+            app_status.set(error);
+        }
+    }
+}
+
+fn apply_zenoh_status_response(
+    response: ZenohStatusResponse,
+    zenoh_state: RwSignal<ZenohConnectionState>,
+    zenoh_status: RwSignal<String>,
+    zenoh_endpoint: RwSignal<String>,
+    zenoh_connection_type: RwSignal<ZenohConnectionType>,
+    app_status: RwSignal<String>,
+    update_app_status: bool,
+) {
+    zenoh_state.set(response.state);
+    zenoh_status.set(response.status.clone());
+    if !response.endpoint.is_empty() {
+        zenoh_endpoint.set(response.endpoint.clone());
+    }
+    zenoh_connection_type.set(response.connection_type);
+    if update_app_status {
+        app_status.set(response.status);
+    }
+}
+
+async fn zenoh_status_api() -> Result<ZenohStatusResponse, String> {
+    zenoh_api_request("GET", "status", None).await
+}
+
+async fn zenoh_connect_request(request: ZenohConnectRequest) -> Result<ZenohStatusResponse, String> {
+    let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    zenoh_api_request("POST", "connect", Some(body)).await
+}
+
+async fn zenoh_disconnect_request() -> Result<ZenohStatusResponse, String> {
+    zenoh_api_request("POST", "disconnect", None).await
+}
+
+async fn robots_api() -> Result<Vec<RobotSummary>, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("Browser window is unavailable.".into());
+    };
+
+    let request = Request::new_with_str("/api/robots").map_err(js_error_text)?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(js_error_text)?;
+
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| format!("{} Could not reach /api/robots.", js_error_text(error)))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| String::from("Invalid backend response."))?;
+    let text = JsFuture::from(response.text().map_err(js_error_text)?)
+        .await
+        .map_err(js_error_text)?
+        .as_string()
+        .unwrap_or_default();
+
+    if response.ok() {
+        serde_json::from_str(&text).map_err(|error| format!("Invalid backend JSON: {error}"))
+    } else {
+        Err(text)
+    }
+}
+
+async fn zenoh_api_request(
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<ZenohStatusResponse, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("Browser window is unavailable.".into());
+    };
+
+    let init = RequestInit::new();
+    init.set_method(method);
+    if let Some(body) = body.as_ref() {
+        init.set_body(&JsValue::from_str(body));
+    }
+
+    let request = Request::new_with_str_and_init(&format!("/api/zenoh/{path}"), &init)
+        .map_err(js_error_text)?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(js_error_text)?;
+    if body.is_some() {
+        request
+            .headers()
+            .set("Content-Type", "application/json")
+            .map_err(js_error_text)?;
+    }
+
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| {
+            format!(
+                "{} Could not reach {}.",
+                js_error_text(error),
+                format!("/api/zenoh/{path}")
+            )
+        })?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| String::from("Invalid backend response."))?;
+    let text = JsFuture::from(response.text().map_err(js_error_text)?)
+        .await
+        .map_err(js_error_text)?
+        .as_string()
+        .unwrap_or_default();
+
+    let payload: ZenohStatusResponse =
+        serde_json::from_str(&text).map_err(|error| format!("Invalid backend JSON: {error}"))?;
+
+    if response.ok() {
+        Ok(payload)
+    } else {
+        Err(payload.status)
+    }
+}
+
+fn js_error_text(value: JsValue) -> String {
+    value
+        .as_string()
+        .unwrap_or_else(|| "Browser request failed.".into())
 }
 
 fn select_item(
@@ -3975,6 +4585,68 @@ fn create_handle(class_name: &str) -> Result<HtmlElement, JsValue> {
     handle.set_attribute("type", "button")?;
     handle.set_class_name(class_name);
     Ok(handle)
+}
+
+fn create_robot_marker(name: &str, yaw_rad: Option<f64>) -> Result<HtmlElement, JsValue> {
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| JsValue::from_str("document unavailable"))?;
+    let root = document.create_element("div")?.dyn_into::<HtmlElement>()?;
+    root.set_class_name("robot-marker");
+
+    let arrow = document.create_element("div")?.dyn_into::<HtmlElement>()?;
+    arrow.set_class_name("robot-arrow");
+    let angle = yaw_rad.unwrap_or(0.0).to_degrees();
+    arrow.style().set_property("transform", &format!("rotate({angle}deg)"))?;
+    root.append_child(&arrow)?;
+
+    let label = document.create_element("div")?.dyn_into::<HtmlElement>()?;
+    label.set_class_name("robot-label");
+    label.set_text_content(Some(name));
+    root.append_child(&label)?;
+
+    Ok(root)
+}
+
+fn set_inline_style(element: &HtmlElement, name: &str, value: &str) -> Result<(), JsValue> {
+    element.style().set_property(name, value)
+}
+
+fn robot_point(workspace: &WorkspaceJson, robot: &RobotSummary) -> Option<JsonPoint> {
+    if let (Some(lat), Some(lon)) = (robot.gnss_lat, robot.gnss_lon) {
+        return Some(JsonPoint { lat, lon });
+    }
+
+    if workspace.ref_point.is_some() {
+        if let (Some(x), Some(y)) = (robot.odom_x, robot.odom_y) {
+            return Some(from_local_xy(workspace, x, y));
+        }
+    }
+
+    None
+}
+
+fn render_robot_markers(map: &JsValue, workspace: &WorkspaceJson, robots: &[RobotSummary]) -> Result<(), JsValue> {
+    clear_markers();
+
+    for robot in robots {
+        let Some(point) = robot_point(workspace, robot) else {
+            continue;
+        };
+
+        let element = create_robot_marker(&robot.name, robot.yaw_rad)?;
+        let color = robot_color(&robot.name);
+        set_inline_style(&element, "--robot-color", &color)?;
+        if is_robot_stale(robot, now_ms()) {
+            let _ = element.class_list().add_1("is-stale");
+        }
+        let marker = create_marker(&element.into(), false)?;
+        set_marker_lng_lat(&marker, &point)?;
+        add_marker_to_map(&marker, map)?;
+        push_marker(marker);
+    }
+
+    Ok(())
 }
 
 fn render_markers(

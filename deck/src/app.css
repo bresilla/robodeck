@@ -124,6 +124,34 @@ button.ghost,
   border-color: rgba(126, 199, 220, 0.16);
 }
 
+.connection-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 112px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(224, 122, 77, 0.2);
+  background: rgba(224, 122, 77, 0.14);
+  color: #f0bc9d;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.connection-pill.is-pending {
+  border-color: rgba(126, 199, 220, 0.22);
+  background: rgba(126, 199, 220, 0.14);
+  color: var(--teal);
+}
+
+.connection-pill.is-connected {
+  border-color: rgba(83, 214, 137, 0.28);
+  background: rgba(83, 214, 137, 0.18);
+  color: #8ff0ae;
+}
+
 input,
 select,
 textarea {
@@ -264,6 +292,72 @@ textarea {
   border: 2px solid white;
   border-radius: 999px;
   box-shadow: 0 6px 16px rgba(20, 33, 41, 0.24);
+}
+
+.robot-marker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.robot-arrow {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  background: #111111;
+  clip-path: polygon(50% 0%, 100% 100%, 50% 78%, 0% 100%);
+  filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.28));
+  transform-origin: 50% 70%;
+}
+
+.robot-arrow::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  background: var(--robot-color, #8ff0ae);
+  clip-path: polygon(50% 0%, 100% 100%, 50% 78%, 0% 100%);
+}
+
+.robot-label {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(17, 24, 29, 0.92);
+  border: 1px solid color-mix(in srgb, var(--robot-color, #8ff0ae) 24%, transparent);
+  color: #dfffea;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.robot-marker:hover .robot-label {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.robot-marker.is-stale {
+  opacity: 0.42;
+}
+
+.list-row.is-stale {
+  opacity: 0.4;
+}
+
+.row-tail-color {
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(245, 249, 250, 0.82);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
 }
 
 .node-handle {
