@@ -1,4 +1,5 @@
 use leptos::prelude::*;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,6 +139,7 @@ enum LeftPanel {
     Reference,
     Zones,
     Graph,
+    Zenoh,
     Robots,
 }
 
@@ -146,7 +148,8 @@ enum RightPanel {
     Details,
     Json,
     Files,
-    Zenoh,
+    Scheduler,
+    Tasks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,9 +219,34 @@ struct ZenohStatusResponse {
     status: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SchedulerTasksResponse {
+    tasks: Vec<String>,
+    status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SchedulerRunRequest {
+    robot: String,
+    task: String,
+    node_id: String,
+    node_name: String,
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SchedulerRunResponse {
+    status: String,
+}
+
+const SCHEDULE_OPTIONS: [&str; 2] = ["goto", "patrol"];
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 struct RobotSummary {
     name: String,
+    #[serde(default)]
+    available_tasks: Vec<String>,
     odom_key: String,
     gnss_keys: Vec<String>,
     gnss_lat: Option<f64>,
@@ -228,6 +256,8 @@ struct RobotSummary {
     yaw_rad: Option<f64>,
     last_seen_ms: u64,
     stale: bool,
+    #[serde(skip, default = "random_robot_color")]
+    color: String,
 }
 
 impl Default for ZenohConnectionType {
@@ -263,7 +293,7 @@ fn App() -> impl IntoView {
     let active_left_panel = RwSignal::new(Some(LeftPanel::Zones));
     let active_right_panel = RwSignal::new(Some(RightPanel::Files));
     let management_left_panel = RwSignal::new(Some(LeftPanel::Robots));
-    let management_right_panel = RwSignal::new(Some(RightPanel::Zenoh));
+    let management_right_panel = RwSignal::new(None::<RightPanel>);
     let status = RwSignal::new(String::from("Ready. Add a root zone or paste workspace JSON."));
     let raw_json = RwSignal::new(
         serde_json::to_string_pretty(&workspace.get()).unwrap_or_else(|_| "{}".into()),
@@ -274,6 +304,12 @@ fn App() -> impl IntoView {
     let zenoh_status = RwSignal::new(String::from("Not connected."));
     let robots = RwSignal::new(Vec::<RobotSummary>::new());
     let robot_clock_ms = RwSignal::new(now_ms());
+    let selected_robot_name = RwSignal::new(String::new());
+    let schedule_selected_task = RwSignal::new(String::from(SCHEDULE_OPTIONS[0]));
+    let scheduler_task_options = RwSignal::new(Vec::<String>::new());
+    let scheduler_selected_task = RwSignal::new(String::new());
+    let scheduler_target_node_id = RwSignal::new(String::new());
+    let scheduler_picking_node = RwSignal::new(false);
     let map_host = NodeRef::<leptos::html::Div>::new();
     let map_initialized = RwSignal::new(false);
     let map_view_tick = RwSignal::new(0_u64);
@@ -306,6 +342,8 @@ fn App() -> impl IntoView {
                 zone_draft_points,
                 pending_zone_parent,
                 active_right_panel,
+                management_right_panel,
+                scheduler_picking_node,
                 status,
                 raw_json,
                 marker_dragging,
@@ -364,6 +402,26 @@ fn App() -> impl IntoView {
                 }
             }
         });
+    });
+
+    Effect::new(move |_| {
+        if !scheduler_picking_node.get() {
+            return;
+        }
+        if let Selection::Node(node_id) = selection.get() {
+            scheduler_target_node_id.set(node_id.clone());
+            scheduler_picking_node.set(false);
+            status.set(format!("Selected node {node_id} for the scheduler."));
+        }
+    });
+
+    Effect::new(move |_| {
+        let selected_robot = selected_robot_name.get();
+        let right_panel = management_right_panel.get();
+        let has_tasks = robot_has_available_tasks(&robots.get(), &selected_robot);
+        if right_panel == Some(RightPanel::Tasks) && !has_tasks {
+            management_right_panel.set(None);
+        }
     });
 
     Effect::new(move |_| {
@@ -435,7 +493,7 @@ fn App() -> impl IntoView {
 
     let switch_to_management = move |_| {
         app_mode.set(AppMode::Management);
-        status.set("Management mode. Zenoh connection controls are available on the right.".into());
+        status.set("Management mode.".into());
     };
 
     let toggle_left_panel = move |panel: LeftPanel| {
@@ -476,6 +534,111 @@ fn App() -> impl IntoView {
                 Some(panel)
             };
         });
+    };
+
+    let open_scheduler_panel = move |_| {
+        let next = if management_right_panel.get_untracked() == Some(RightPanel::Scheduler) {
+            None
+        } else {
+            Some(RightPanel::Scheduler)
+        };
+        management_right_panel.set(next);
+    };
+
+    let open_tasks_panel = move |_| {
+        let robot = selected_robot_name.get_untracked();
+        if !robot_has_available_tasks(&robots.get_untracked(), &robot) {
+            management_right_panel.set(None);
+            status.set("No task topic detected for the selected robot.".into());
+            return;
+        }
+        let next = if management_right_panel.get_untracked() == Some(RightPanel::Tasks) {
+            None
+        } else {
+            Some(RightPanel::Tasks)
+        };
+        management_right_panel.set(next);
+        if next.is_some() {
+            if !robot.is_empty() {
+                spawn_local(refresh_scheduler_tasks(
+                    robot,
+                    scheduler_task_options,
+                    scheduler_selected_task,
+                    status,
+                ));
+            }
+        }
+    };
+
+    let arm_scheduler_node_pick = move |_| {
+        let next = !scheduler_picking_node.get_untracked();
+        scheduler_picking_node.set(next);
+        if next {
+            scheduler_target_node_id.set(String::new());
+            status.set("Scheduler node pick armed. Click one node.".into());
+        } else {
+            status.set("Scheduler node pick cancelled.".into());
+        }
+    };
+
+    let run_scheduler_task = move |_| {
+        let robot = selected_robot_name.get_untracked();
+        let task = scheduler_selected_task.get_untracked();
+        let node_id = scheduler_target_node_id.get_untracked();
+        let Some(node) = workspace.get_untracked().nodes.get(&node_id).cloned() else {
+            status.set("Select a scheduler node first.".into());
+            return;
+        };
+        if robot.is_empty() {
+            status.set("Select a robot first.".into());
+            return;
+        }
+        if task.is_empty() {
+            status.set("Select a task first.".into());
+            return;
+        }
+        status.set(format!("Sending {task} to {robot}..."));
+        spawn_local(run_scheduler_task_api(
+            SchedulerRunRequest {
+                robot,
+                task,
+                node_id: node.id,
+                node_name: node.name,
+                lat: node.latlon.lat,
+                lon: node.latlon.lon,
+            },
+            status,
+        ));
+    };
+
+    let run_schedule_task = move |_| {
+        let robot = selected_robot_name.get_untracked();
+        let task = schedule_selected_task.get_untracked();
+        let node_id = scheduler_target_node_id.get_untracked();
+        let Some(node) = workspace.get_untracked().nodes.get(&node_id).cloned() else {
+            status.set("Select a scheduler node first.".into());
+            return;
+        };
+        if robot.is_empty() {
+            status.set("Select a robot first.".into());
+            return;
+        }
+        if task.is_empty() {
+            status.set("Select a schedule first.".into());
+            return;
+        }
+        status.set(format!("Sending {task} schedule to {robot}..."));
+        spawn_local(run_scheduler_task_api(
+            SchedulerRunRequest {
+                robot,
+                task,
+                node_id: node.id,
+                node_name: node.name,
+                lat: node.latlon.lat,
+                lon: node.latlon.lon,
+            },
+            status,
+        ));
     };
 
     let apply_json = move |_: MouseEvent| match serde_json::from_str::<WorkspaceJson>(&raw_json.get()) {
@@ -640,6 +803,15 @@ fn App() -> impl IntoView {
                             <Show
                                 when=move || app_mode.get() == AppMode::Editor
                                 fallback=move || view! {
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || management_left_panel.get() == Some(LeftPanel::Zenoh)
+                                        on:click=move |_| toggle_management_left_panel(LeftPanel::Zenoh)
+                                        type="button"
+                                        title="Toggle Zenoh panel"
+                                    >
+                                        "Z"
+                                    </button>
                                     <button
                                         class="panel-toggle"
                                         class:is-active=move || management_left_panel.get() == Some(LeftPanel::Robots)
@@ -1007,6 +1179,90 @@ fn App() -> impl IntoView {
                             <Show when=move || app_mode.get() == AppMode::Management>
                                 <section
                                     class="card floating-panel left-panel-card"
+                                    class:is-hidden=move || management_left_panel.get() != Some(LeftPanel::Zenoh)
+                                >
+                                    <div class="panel-head panel-head-stack">
+                                        <div>
+                                            <p class="section">"Zenoh"</p>
+                                            <h3>"Connection"</h3>
+                                        </div>
+                                        <div
+                                            class="connection-pill"
+                                            class:is-connected=move || zenoh_state.get() == ZenohConnectionState::Connected
+                                            class:is-pending=move || zenoh_state.get() == ZenohConnectionState::Connecting
+                                        >
+                                            {move || {
+                                                match zenoh_state.get() {
+                                                    ZenohConnectionState::Disconnected => "Disconnected",
+                                                    ZenohConnectionState::Connecting => "Connecting",
+                                                    ZenohConnectionState::Connected => "Connected",
+                                                    ZenohConnectionState::Error => "Error",
+                                                }
+                                            }}
+                                        </div>
+                                    </div>
+                                    <div class="field-group">
+                                        <label class="field">
+                                            <span>"Connection"</span>
+                                            <input
+                                                placeholder="localhost:7447"
+                                                prop:value=move || zenoh_endpoint.get()
+                                                on:input=move |ev| zenoh_endpoint.set(event_target_value(&ev))
+                                            />
+                                        </label>
+                                        <label class="field">
+                                            <span>"Connection Type"</span>
+                                            <select
+                                                prop:value=move || zenoh_connection_type.get().as_str()
+                                                on:change=move |ev| {
+                                                    zenoh_connection_type.set(ZenohConnectionType::from_value(&event_target_value(&ev)));
+                                                }
+                                            >
+                                                <option value="ws">"WebSocket"</option>
+                                                <option value="tcp">"TCP"</option>
+                                                <option value="udp">"UDP"</option>
+                                                <option value="quic">"QUIC"</option>
+                                            </select>
+                                        </label>
+                                    </div>
+                                    <div class="panel-card">
+                                        <div class="panel-head compact-head">
+                                            <div>
+                                                <p class="section">"Status"</p>
+                                                <h3>"Session"</h3>
+                                            </div>
+                                        </div>
+                                        <p class="hint">
+                                            {move || zenoh_status.get()}
+                                        </p>
+                                        <p class="hint">
+                                            {move || {
+                                                format!(
+                                                    "The Rust backend owns the Zenoh session and reports connection state back to this tab over the local API."
+                                                )
+                                            }}
+                                        </p>
+                                    </div>
+                                    <div class="dock-actions">
+                                        <button
+                                            class="primary"
+                                            on:click=connect_zenoh
+                                            type="button"
+                                        >
+                                            "Connect"
+                                        </button>
+                                        <button
+                                            class="ghost"
+                                            on:click=disconnect_zenoh
+                                            type="button"
+                                        >
+                                            "Disconnect"
+                                        </button>
+                                    </div>
+                                </section>
+
+                                <section
+                                    class="card floating-panel left-panel-card"
                                     class:is-hidden=move || management_left_panel.get() != Some(LeftPanel::Robots)
                                 >
                                     <div class="panel-head">
@@ -1030,6 +1286,11 @@ fn App() -> impl IntoView {
                                                 <RobotFleetRow
                                                     robot=robot
                                                     workspace=workspace
+                                                    selected_robot_name=selected_robot_name
+                                                    scheduler_task_options=scheduler_task_options
+                                                    scheduler_selected_task=scheduler_selected_task
+                                                    scheduler_target_node_id=scheduler_target_node_id
+                                                    management_right_panel=management_right_panel
                                                     status=status
                                                     robot_clock_ms=robot_clock_ms
                                                 />
@@ -1065,7 +1326,7 @@ fn App() -> impl IntoView {
                             <div class="right-stack">
                                 <Show
                                     when=move || app_mode.get() == AppMode::Editor
-                                    fallback=move || view! {
+                                fallback=move || view! {
                                         <button
                                             class="panel-toggle"
                                             class:is-active=move || management_right_panel.get() == Some(RightPanel::Details)
@@ -1077,13 +1338,24 @@ fn App() -> impl IntoView {
                                         </button>
                                         <button
                                             class="panel-toggle"
-                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Zenoh)
-                                            on:click=move |_| toggle_management_right_panel(RightPanel::Zenoh)
+                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Scheduler)
+                                            on:click=open_scheduler_panel
                                             type="button"
-                                            title="Toggle Zenoh panel"
+                                            title="Toggle scheduler panel"
                                         >
-                                            "Z"
+                                            "S"
                                         </button>
+                                        <Show when=move || robot_has_available_tasks(&robots.get(), &selected_robot_name.get())>
+                                            <button
+                                                class="panel-toggle"
+                                                class:is-active=move || management_right_panel.get() == Some(RightPanel::Tasks)
+                                                on:click=open_tasks_panel
+                                                type="button"
+                                                title="Toggle tasks panel"
+                                            >
+                                                "T"
+                                            </button>
+                                        </Show>
                                     }
                                 >
                                     <button
@@ -1250,6 +1522,233 @@ fn App() -> impl IntoView {
                                 <Show when=move || app_mode.get() == AppMode::Management>
                                     <section
                                         class="card floating-panel right-panel-card"
+                                        class:is-hidden=move || management_right_panel.get() != Some(RightPanel::Scheduler)
+                                    >
+                                        <div class="panel-head panel-head-stack">
+                                            <div>
+                                                <p class="section">"Scheduler"</p>
+                                                <h3>{move || {
+                                                    let robot = selected_robot_name.get();
+                                                    if robot.is_empty() {
+                                                        "No robot selected".to_string()
+                                                    } else {
+                                                        robot
+                                                    }
+                                                }}</h3>
+                                            </div>
+                                            <p class="hint">
+                                                {move || {
+                                                    if scheduler_picking_node.get() {
+                                                        "Click a node on the map or in the list.".to_string()
+                                                    } else {
+                                                        "Select a robot, schedule, and node.".to_string()
+                                                    }
+                                                }}
+                                            </p>
+                                        </div>
+                                        <div class="field-group">
+                                            <div class="panel-card">
+                                                <div class="panel-head compact-head">
+                                                    <div>
+                                                        <p class="section">"Schedule"</p>
+                                                        <h3>{move || schedule_selected_task.get()}</h3>
+                                                    </div>
+                                                </div>
+                                                <div class="dock-actions">
+                                                    <button
+                                                        class="ghost"
+                                                        class:is-armed=move || schedule_selected_task.get() == SCHEDULE_OPTIONS[0]
+                                                        disabled=move || selected_robot_name.get().is_empty()
+                                                        on:click=move |_| schedule_selected_task.set(SCHEDULE_OPTIONS[0].into())
+                                                        type="button"
+                                                    >
+                                                        "goto"
+                                                    </button>
+                                                    <button
+                                                        class="ghost"
+                                                        class:is-armed=move || schedule_selected_task.get() == SCHEDULE_OPTIONS[1]
+                                                        disabled=move || selected_robot_name.get().is_empty()
+                                                        on:click=move |_| schedule_selected_task.set(SCHEDULE_OPTIONS[1].into())
+                                                        type="button"
+                                                    >
+                                                        "patrol"
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div class="panel-card">
+                                                <div class="panel-head compact-head">
+                                                    <div>
+                                                        <p class="section">"Target"</p>
+                                                        <h3>{move || {
+                                                            let node_id = scheduler_target_node_id.get();
+                                                            if node_id.is_empty() {
+                                                                "No node selected".to_string()
+                                                            } else {
+                                                                workspace
+                                                                    .get()
+                                                                    .nodes
+                                                                    .get(&node_id)
+                                                                    .map(|node| node.name.clone())
+                                                                    .unwrap_or(node_id)
+                                                            }
+                                                        }}</h3>
+                                                    </div>
+                                                </div>
+                                                <p class="hint">
+                                                    {move || {
+                                                        let node_id = scheduler_target_node_id.get();
+                                                        if node_id.is_empty() {
+                                                            "Arm node picking, then click one node.".to_string()
+                                                        } else {
+                                                            workspace
+                                                                .get()
+                                                                .nodes
+                                                                .get(&node_id)
+                                                                .map(|node| point_text(&node.latlon))
+                                                                .unwrap_or_else(|| "Node no longer exists.".to_string())
+                                                        }
+                                                    }}
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <div class="dock-actions">
+                                            <button
+                                                class="ghost"
+                                                class:is-armed=move || scheduler_picking_node.get()
+                                                disabled=move || selected_robot_name.get().is_empty()
+                                                on:click=arm_scheduler_node_pick
+                                                type="button"
+                                            >
+                                                {move || if scheduler_picking_node.get() { "Cancel Node Pick" } else { "Select Node" }}
+                                            </button>
+                                            <button
+                                                class="primary"
+                                                disabled=move || {
+                                                    selected_robot_name.get().is_empty()
+                                                        || schedule_selected_task.get().is_empty()
+                                                        || scheduler_target_node_id.get().is_empty()
+                                                }
+                                                on:click=run_schedule_task
+                                                type="button"
+                                            >
+                                                "Run"
+                                            </button>
+                                        </div>
+                                    </section>
+
+                                    <section
+                                        class="card floating-panel right-panel-card"
+                                        class:is-hidden=move || management_right_panel.get() != Some(RightPanel::Tasks)
+                                    >
+                                        <div class="panel-head panel-head-stack">
+                                            <div>
+                                                <p class="section">"Tasks"</p>
+                                                <h3>{move || {
+                                                    let robot = selected_robot_name.get();
+                                                    if robot.is_empty() {
+                                                        "No robot selected".to_string()
+                                                    } else {
+                                                        robot
+                                                    }
+                                                }}</h3>
+                                            </div>
+                                            <p class="hint">
+                                                {move || {
+                                                    if scheduler_picking_node.get() {
+                                                        "Click a node on the map or in the list.".to_string()
+                                                    } else {
+                                                        "Select a robot, task, and node.".to_string()
+                                                    }
+                                                }}
+                                            </p>
+                                        </div>
+                                        <div class="field-group">
+                                            <label class="field">
+                                                <span>"Task"</span>
+                                                <select
+                                                    prop:value=move || scheduler_selected_task.get()
+                                                    disabled=move || selected_robot_name.get().is_empty()
+                                                    on:change=move |ev| scheduler_selected_task.set(event_target_value(&ev))
+                                                >
+                                                    <Show
+                                                        when=move || !scheduler_task_options.get().is_empty()
+                                                        fallback=move || view! {
+                                                            <option value="">"No tasks available"</option>
+                                                        }
+                                                    >
+                                                        <For
+                                                            each=move || scheduler_task_options.get()
+                                                            key=|task| task.clone()
+                                                            let:task
+                                                        >
+                                                            <option value=task.clone()>{task.clone()}</option>
+                                                        </For>
+                                                    </Show>
+                                                </select>
+                                            </label>
+                                            <div class="panel-card">
+                                                <div class="panel-head compact-head">
+                                                    <div>
+                                                        <p class="section">"Target"</p>
+                                                        <h3>{move || {
+                                                            let node_id = scheduler_target_node_id.get();
+                                                            if node_id.is_empty() {
+                                                                "No node selected".to_string()
+                                                            } else {
+                                                                workspace
+                                                                    .get()
+                                                                    .nodes
+                                                                    .get(&node_id)
+                                                                    .map(|node| node.name.clone())
+                                                                    .unwrap_or(node_id)
+                                                            }
+                                                        }}</h3>
+                                                    </div>
+                                                </div>
+                                                <p class="hint">
+                                                    {move || {
+                                                        let node_id = scheduler_target_node_id.get();
+                                                        if node_id.is_empty() {
+                                                            "Arm node picking, then click one node.".to_string()
+                                                        } else {
+                                                            workspace
+                                                                .get()
+                                                                .nodes
+                                                                .get(&node_id)
+                                                                .map(|node| point_text(&node.latlon))
+                                                                .unwrap_or_else(|| "Node no longer exists.".to_string())
+                                                        }
+                                                    }}
+                                                </p>
+                                            </div>
+                                        </div>
+                                        <div class="dock-actions">
+                                            <button
+                                                class="ghost"
+                                                class:is-armed=move || scheduler_picking_node.get()
+                                                disabled=move || selected_robot_name.get().is_empty()
+                                                on:click=arm_scheduler_node_pick
+                                                type="button"
+                                            >
+                                                {move || if scheduler_picking_node.get() { "Cancel Node Pick" } else { "Select Node" }}
+                                            </button>
+                                            <button
+                                                class="primary"
+                                                disabled=move || {
+                                                    selected_robot_name.get().is_empty()
+                                                        || scheduler_selected_task.get().is_empty()
+                                                        || scheduler_target_node_id.get().is_empty()
+                                                }
+                                                on:click=run_scheduler_task
+                                                type="button"
+                                            >
+                                                "Run"
+                                            </button>
+                                        </div>
+                                    </section>
+
+                                    <section
+                                        class="card floating-panel right-panel-card"
                                         class:is-hidden=move || management_right_panel.get() != Some(RightPanel::Details)
                                     >
                                         <div class="panel-head">
@@ -1260,90 +1759,6 @@ fn App() -> impl IntoView {
                                         </div>
                                         <div class="inspector-stack">
                                             <p class="hint">"Fleet management is not implemented yet."</p>
-                                        </div>
-                                    </section>
-
-                                    <section
-                                        class="card floating-panel right-panel-card"
-                                        class:is-hidden=move || management_right_panel.get() != Some(RightPanel::Zenoh)
-                                    >
-                                        <div class="panel-head panel-head-stack">
-                                            <div>
-                                                <p class="section">"Zenoh"</p>
-                                                <h3>"Connection"</h3>
-                                            </div>
-                                            <div
-                                                class="connection-pill"
-                                                class:is-connected=move || zenoh_state.get() == ZenohConnectionState::Connected
-                                                class:is-pending=move || zenoh_state.get() == ZenohConnectionState::Connecting
-                                            >
-                                                {move || {
-                                                    match zenoh_state.get() {
-                                                        ZenohConnectionState::Disconnected => "Disconnected",
-                                                        ZenohConnectionState::Connecting => "Connecting",
-                                                        ZenohConnectionState::Connected => "Connected",
-                                                        ZenohConnectionState::Error => "Error",
-                                                    }
-                                                }}
-                                            </div>
-                                        </div>
-                                        <div class="field-group">
-                                            <label class="field">
-                                                <span>"Connection"</span>
-                                                <input
-                                                    placeholder="localhost:7447"
-                                                    prop:value=move || zenoh_endpoint.get()
-                                                    on:input=move |ev| zenoh_endpoint.set(event_target_value(&ev))
-                                                />
-                                            </label>
-                                            <label class="field">
-                                                <span>"Connection Type"</span>
-                                                <select
-                                                    prop:value=move || zenoh_connection_type.get().as_str()
-                                                    on:change=move |ev| {
-                                                        zenoh_connection_type.set(ZenohConnectionType::from_value(&event_target_value(&ev)));
-                                                    }
-                                                >
-                                                    <option value="ws">"WebSocket"</option>
-                                                    <option value="tcp">"TCP"</option>
-                                                    <option value="udp">"UDP"</option>
-                                                    <option value="quic">"QUIC"</option>
-                                                </select>
-                                            </label>
-                                        </div>
-                                        <div class="panel-card">
-                                            <div class="panel-head compact-head">
-                                                <div>
-                                                    <p class="section">"Status"</p>
-                                                    <h3>"Session"</h3>
-                                                </div>
-                                            </div>
-                                            <p class="hint">
-                                                {move || zenoh_status.get()}
-                                            </p>
-                                            <p class="hint">
-                                                {move || {
-                                                    format!(
-                                                        "The Rust backend owns the Zenoh session and reports connection state back to this tab over the local API."
-                                                    )
-                                                }}
-                                            </p>
-                                        </div>
-                                        <div class="dock-actions">
-                                            <button
-                                                class="primary"
-                                                on:click=connect_zenoh
-                                                type="button"
-                                            >
-                                                "Connect"
-                                            </button>
-                                            <button
-                                                class="ghost"
-                                                on:click=disconnect_zenoh
-                                                type="button"
-                                            >
-                                                "Disconnect"
-                                            </button>
                                         </div>
                                     </section>
                                 </Show>
@@ -1582,10 +1997,16 @@ fn ZoneTreeNode(
 fn RobotFleetRow(
     robot: RobotSummary,
     workspace: RwSignal<WorkspaceJson>,
+    selected_robot_name: RwSignal<String>,
+    scheduler_task_options: RwSignal<Vec<String>>,
+    scheduler_selected_task: RwSignal<String>,
+    scheduler_target_node_id: RwSignal<String>,
+    management_right_panel: RwSignal<Option<RightPanel>>,
     status: RwSignal<String>,
     robot_clock_ms: RwSignal<u64>,
 ) -> impl IntoView {
     let robot_name = robot.name.clone();
+    let selected_robot_id = robot.name.clone();
     let row_meta = {
         let mut parts = Vec::new();
         if !robot.odom_key.is_empty() {
@@ -1600,11 +2021,13 @@ fn RobotFleetRow(
             parts.join(" | ")
         }
     };
-    let robot_color = robot_color(&robot.name);
+    let robot_color = robot.color.clone();
 
     let focus_robot = {
         let robot = robot.clone();
         move |_| {
+            selected_robot_name.set(robot.name.clone());
+            scheduler_target_node_id.set(String::new());
             let ws = workspace.get();
             if let Some(point) = robot_point(&ws, &robot) {
                 MAP_HANDLE.with(|cell| {
@@ -1612,12 +2035,21 @@ fn RobotFleetRow(
                         let _ = focus_map_point(map, &point, 18.0);
                     }
                 });
-                status.set(format!("Focused robot {}.", robot.name));
+                status.set(format!("Selected robot {}.", robot.name));
             } else {
                 status.set(format!(
-                    "Robot {} has no mappable odom or gnss position yet.",
+                    "Selected robot {}. It has no mappable odom or gnss position yet.",
                     robot.name
                 ));
+            }
+            spawn_local(refresh_scheduler_tasks(
+                robot.name.clone(),
+                scheduler_task_options,
+                scheduler_selected_task,
+                status,
+            ));
+            if management_right_panel.get_untracked() == Some(RightPanel::Scheduler) {
+                scheduler_target_node_id.set(String::new());
             }
         }
     };
@@ -1626,6 +2058,7 @@ fn RobotFleetRow(
         <button
             class="list-row"
             class:is-stale=move || is_robot_stale(&robot, robot_clock_ms.get())
+            class:is-selected=move || selected_robot_name.get() == selected_robot_id
             type="button"
             on:click=focus_robot
         >
@@ -2895,26 +3328,34 @@ fn is_robot_stale(robot: &RobotSummary, now_ms: u64) -> bool {
     robot.stale
 }
 
-fn robot_color(name: &str) -> String {
-    const PALETTE: [&str; 10] = [
-        "#e07a4d",
-        "#7ec7dc",
-        "#8ff0ae",
-        "#f3c96b",
-        "#ff8fab",
-        "#9bdeac",
-        "#6ea8fe",
-        "#f28482",
-        "#84dcc6",
-        "#cdb4db",
-    ];
+fn robot_has_available_tasks(robots: &[RobotSummary], robot_name: &str) -> bool {
+    !robot_name.is_empty()
+        && robots
+            .iter()
+            .find(|robot| robot.name == robot_name)
+            .map(|robot| !robot.available_tasks.is_empty())
+            .unwrap_or(false)
+}
 
-    let mut hash = 0_u64;
-    for byte in name.bytes() {
-        hash = hash.wrapping_mul(131).wrapping_add(u64::from(byte));
+fn random_robot_color() -> String {
+    let mut rng = rand::thread_rng();
+    let hue = rng.gen_range(0..360);
+    let saturation = rng.gen_range(62..82);
+    let lightness = rng.gen_range(54..68);
+    format!("hsl({hue} {saturation}% {lightness}%)")
+}
+
+fn preserve_robot_colors(current: &[RobotSummary], next: &mut [RobotSummary]) {
+    let colors_by_name = current
+        .iter()
+        .map(|robot| (robot.name.clone(), robot.color.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for robot in next {
+        if let Some(color) = colors_by_name.get(&robot.name) {
+            robot.color = color.clone();
+        }
     }
-
-    PALETTE[(hash as usize) % PALETTE.len()].to_string()
 }
 
 async fn refresh_zenoh_status(
@@ -2939,7 +3380,8 @@ async fn refresh_zenoh_status(
 }
 
 async fn refresh_robots(robots: RwSignal<Vec<RobotSummary>>) {
-    if let Ok(next) = robots_api().await {
+    if let Ok(mut next) = robots_api().await {
+        preserve_robot_colors(&robots.get_untracked(), &mut next);
         robots.set(next);
     }
 }
@@ -3026,6 +3468,117 @@ async fn zenoh_connect_request(request: ZenohConnectRequest) -> Result<ZenohStat
 
 async fn zenoh_disconnect_request() -> Result<ZenohStatusResponse, String> {
     zenoh_api_request("POST", "disconnect", None).await
+}
+
+async fn refresh_scheduler_tasks(
+    robot: String,
+    scheduler_task_options: RwSignal<Vec<String>>,
+    scheduler_selected_task: RwSignal<String>,
+    app_status: RwSignal<String>,
+) {
+    match scheduler_tasks_api(&robot).await {
+        Ok(response) => {
+            let selected = response
+                .tasks
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            scheduler_task_options.set(response.tasks);
+            scheduler_selected_task.set(selected);
+            app_status.set(response.status);
+        }
+        Err(error) => {
+            scheduler_task_options.set(Vec::new());
+            scheduler_selected_task.set(String::new());
+            app_status.set(error);
+        }
+    }
+}
+
+async fn run_scheduler_task_api(
+    request: SchedulerRunRequest,
+    app_status: RwSignal<String>,
+) {
+    match scheduler_run_request(request).await {
+        Ok(response) => app_status.set(response.status),
+        Err(error) => app_status.set(error),
+    }
+}
+
+async fn scheduler_tasks_api(robot: &str) -> Result<SchedulerTasksResponse, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("Browser window is unavailable.".into());
+    };
+
+    let init = RequestInit::new();
+    init.set_cache(RequestCache::NoStore);
+    let request = Request::new_with_str_and_init(&format!("/api/zenoh/tasks/{robot}"), &init)
+        .map_err(js_error_text)?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(js_error_text)?;
+
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| format!("{} Could not reach /api/zenoh/tasks/{robot}.", js_error_text(error)))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| String::from("Invalid backend response."))?;
+    let text = JsFuture::from(response.text().map_err(js_error_text)?)
+        .await
+        .map_err(js_error_text)?
+        .as_string()
+        .unwrap_or_default();
+    let payload: SchedulerTasksResponse =
+        serde_json::from_str(&text).map_err(|error| format!("Invalid backend JSON: {error}"))?;
+    if response.ok() {
+        Ok(payload)
+    } else {
+        Err(payload.status)
+    }
+}
+
+async fn scheduler_run_request(request: SchedulerRunRequest) -> Result<SchedulerRunResponse, String> {
+    let Some(window) = web_sys::window() else {
+        return Err("Browser window is unavailable.".into());
+    };
+
+    let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_cache(RequestCache::NoStore);
+    init.set_body(&JsValue::from_str(&body));
+
+    let request = Request::new_with_str_and_init("/api/zenoh/task", &init)
+        .map_err(js_error_text)?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(js_error_text)?;
+    request
+        .headers()
+        .set("Content-Type", "application/json")
+        .map_err(js_error_text)?;
+
+    let response_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| format!("{} Could not reach /api/zenoh/task.", js_error_text(error)))?;
+    let response: Response = response_value
+        .dyn_into()
+        .map_err(|_| String::from("Invalid backend response."))?;
+    let text = JsFuture::from(response.text().map_err(js_error_text)?)
+        .await
+        .map_err(js_error_text)?
+        .as_string()
+        .unwrap_or_default();
+    let payload: SchedulerRunResponse =
+        serde_json::from_str(&text).map_err(|error| format!("Invalid backend JSON: {error}"))?;
+    if response.ok() {
+        Ok(payload)
+    } else {
+        Err(payload.status)
+    }
 }
 
 async fn robots_api() -> Result<Vec<RobotSummary>, String> {
@@ -3795,6 +4348,8 @@ fn bind_map_interactions(
     zone_draft_points: RwSignal<Vec<JsonPoint>>,
     pending_zone_parent: RwSignal<Option<String>>,
     active_right_panel: RwSignal<Option<RightPanel>>,
+    management_right_panel: RwSignal<Option<RightPanel>>,
+    scheduler_picking_node: RwSignal<bool>,
     status: RwSignal<String>,
     raw_json: RwSignal<String>,
     marker_dragging: RwSignal<bool>,
@@ -4040,7 +4595,15 @@ fn bind_map_interactions(
     attach_map_event(map, "click", {
         let map = map.clone();
         move |event| {
-            if app_mode.get() != AppMode::Editor {
+            let current_app_mode = app_mode.get();
+            let scheduler_pick_active =
+                current_app_mode == AppMode::Management
+                    && scheduler_picking_node.get()
+                    && matches!(
+                        management_right_panel.get(),
+                        Some(RightPanel::Scheduler | RightPanel::Tasks)
+                    );
+            if current_app_mode != AppMode::Editor && !scheduler_pick_active {
                 return;
             }
             if scene_drag.get().is_some() {
@@ -4065,7 +4628,10 @@ fn bind_map_interactions(
 
             let node_features = query_rendered_feature_ids(&map, &event, &["node-hit", "node-circle"]);
             if let Some(node_id) = node_features.first().cloned() {
-                if mode.get() == Mode::ConnectEdge {
+                if scheduler_pick_active {
+                    selection.set(Selection::Node(node_id.clone()));
+                    status.set(format!("Scheduler target node {node_id} selected."));
+                } else if mode.get() == Mode::ConnectEdge {
                     pick_node_for_edge(
                         workspace,
                         selection,
@@ -4636,8 +5202,7 @@ fn render_robot_markers(map: &JsValue, workspace: &WorkspaceJson, robots: &[Robo
         };
 
         let element = create_robot_marker(&robot.name, robot.yaw_rad)?;
-        let color = robot_color(&robot.name);
-        set_inline_style(&element, "--robot-color", &color)?;
+        set_inline_style(&element, "--robot-color", &robot.color)?;
         if is_robot_stale(robot, now_ms()) {
             let _ = element.class_list().add_1("is-stale");
         }

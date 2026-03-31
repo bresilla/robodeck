@@ -1,4 +1,5 @@
 use axum::{
+    extract::Path as AxumPath,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
@@ -73,8 +74,31 @@ pub struct ZenohStatusResponse {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SchedulerTasksResponse {
+    pub tasks: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SchedulerRunRequest {
+    pub robot: String,
+    pub task: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SchedulerRunResponse {
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RobotSummary {
     pub name: String,
+    #[serde(default)]
+    pub available_tasks: Vec<String>,
     pub odom_key: String,
     pub gnss_keys: Vec<String>,
     pub gnss_lat: Option<f64>,
@@ -116,6 +140,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/zenoh/status", get(zenoh_status))
         .route("/api/zenoh/connect", post(zenoh_connect))
         .route("/api/zenoh/disconnect", post(zenoh_disconnect))
+        .route("/api/zenoh/tasks/{robot}", get(zenoh_tasks))
+        .route("/api/zenoh/task", post(zenoh_run_task))
         .route("/api/robots", get(robots))
         .fallback_service(static_files)
         .with_state(state.clone());
@@ -201,6 +227,12 @@ async fn zenoh_connect(
                 "**/gnss",
                 TopicKind::Gnss,
             ));
+            let tasks_watch = tokio::spawn(watch_robot_topics(
+                state.clone(),
+                session.clone(),
+                "**/available_tasks",
+                TopicKind::AvailableTasks,
+            ));
             let activity_watch = tokio::spawn(watch_robot_activity(
                 state.clone(),
                 session.clone(),
@@ -222,6 +254,7 @@ async fn zenoh_connect(
                 odom_watch,
                 gnss_watch,
                 gnss_root_watch,
+                tasks_watch,
                 activity_watch,
                 cleanup_watch,
             ];
@@ -248,6 +281,112 @@ async fn zenoh_disconnect(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(response))
 }
 
+async fn zenoh_tasks(
+    State(state): State<AppState>,
+    AxumPath(robot): AxumPath<String>,
+) -> impl IntoResponse {
+    let robot = robot.trim_matches('/').to_string();
+    if robot.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SchedulerTasksResponse {
+                tasks: Vec::new(),
+                status: "Select a robot first.".into(),
+            }),
+        );
+    }
+
+    let manager = state.zenoh.lock().await;
+    if manager.session.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SchedulerTasksResponse {
+                tasks: Vec::new(),
+                status: "Connect to Zenoh first.".into(),
+            }),
+        );
+    }
+    let mut tasks = manager
+        .robots
+        .get(&robot)
+        .map(|robot| robot.available_tasks.clone())
+        .unwrap_or_default();
+    drop(manager);
+
+    tasks.retain(|task| !task.trim().is_empty());
+    tasks.sort();
+    tasks.dedup();
+
+    (
+        StatusCode::OK,
+        Json(SchedulerTasksResponse {
+            status: format!("Loaded tasks for {robot}."),
+            tasks,
+        }),
+    )
+}
+
+async fn zenoh_run_task(
+    State(state): State<AppState>,
+    Json(request): Json<SchedulerRunRequest>,
+) -> impl IntoResponse {
+    let robot = request.robot.trim_matches('/').to_string();
+    if robot.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SchedulerRunResponse {
+                status: "Select a robot first.".into(),
+            }),
+        );
+    }
+    if request.task.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SchedulerRunResponse {
+                status: "Select a task first.".into(),
+            }),
+        );
+    }
+    if request.node_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SchedulerRunResponse {
+                status: "Select a target node first.".into(),
+            }),
+        );
+    }
+
+    let session = state.zenoh.lock().await.session.clone();
+    let Some(session) = session else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SchedulerRunResponse {
+                status: "Connect to Zenoh first.".into(),
+            }),
+        );
+    };
+
+    let key = format!("{robot}/task");
+    let payload = serde_json::to_vec(&request).unwrap_or_default();
+    match session.put(&key, payload).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(SchedulerRunResponse {
+                status: format!(
+                    "Sent {} to {} for node {}.",
+                    request.task, robot, request.node_name
+                ),
+            }),
+        ),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(SchedulerRunResponse {
+                status: format!("Failed to send task to {key}: {error}"),
+            }),
+        ),
+    }
+}
+
 async fn disconnect_existing_session(state: &AppState) {
     let (session, watches) = {
         let mut manager = state.zenoh.lock().await;
@@ -262,6 +401,40 @@ async fn disconnect_existing_session(state: &AppState) {
     if let Some(session) = session {
         let _ = session.close().await;
     }
+}
+
+fn parse_available_tasks(payload: &[u8]) -> Vec<String> {
+    if let Ok(message) = decode_ros_message::<RosString>(payload) {
+        return parse_available_tasks_text(message.data.as_bytes());
+    }
+    parse_available_tasks_text(payload)
+}
+
+fn parse_available_tasks_text(payload: &[u8]) -> Vec<String> {
+    if let Ok(tasks) = serde_json::from_slice::<Vec<String>>(payload) {
+        return tasks;
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+        if let Some(tasks) = value.get("tasks").and_then(|tasks| tasks.as_array()) {
+            return tasks
+                .iter()
+                .filter_map(|task| task.as_str().map(ToOwned::to_owned))
+                .collect();
+        }
+        if let Some(task) = value.as_str() {
+            return vec![task.to_string()];
+        }
+    }
+    std::str::from_utf8(payload)
+        .ok()
+        .map(|text| {
+            text.split([',', '\n'])
+                .map(str::trim)
+                .filter(|task| !task.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn shutdown_signal(state: AppState) {
@@ -317,6 +490,7 @@ fn normalize_locator(
 enum TopicKind {
     Odom,
     Gnss,
+    AvailableTasks,
 }
 
 async fn watch_robot_topics(
@@ -348,6 +522,7 @@ async fn watch_robot_topics(
         let mut manager = state.zenoh.lock().await;
         let robot = manager.robots.entry(robot_name.clone()).or_insert_with(|| RobotSummary {
                 name: robot_name,
+                available_tasks: Vec::new(),
                 odom_key: String::new(),
                 gnss_keys: Vec::new(),
                 gnss_lat: None,
@@ -388,6 +563,13 @@ async fn watch_robot_topics(
                     robot.gnss_lat = Some(fix.latitude);
                     robot.gnss_lon = Some(fix.longitude);
                 }
+            }
+            TopicKind::AvailableTasks => {
+                let mut tasks = parse_available_tasks(sample.payload().to_bytes().as_ref());
+                tasks.retain(|task| !task.trim().is_empty());
+                tasks.sort();
+                tasks.dedup();
+                robot.available_tasks = tasks;
             }
         }
     }
@@ -464,6 +646,7 @@ fn robot_prefix_from_key(key: &str, topic_kind: TopicKind) -> Option<String> {
     let prefix = match topic_kind {
         TopicKind::Odom => trimmed.strip_suffix("/odom")?,
         TopicKind::Gnss => trimmed.split_once("/gnss")?.0,
+        TopicKind::AvailableTasks => trimmed.strip_suffix("/available_tasks")?,
     };
     Some(prefix.to_string())
 }
@@ -499,6 +682,11 @@ struct RosTime {
 struct RosHeader {
     stamp: RosTime,
     frame_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RosString {
+    data: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
