@@ -240,7 +240,7 @@ struct SchedulerRunResponse {
     status: String,
 }
 
-const SCHEDULE_OPTIONS: [&str; 2] = ["goto", "patrol"];
+const ORDER_OPTIONS: [&str; 2] = ["goto", "patrol"];
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 struct RobotSummary {
@@ -305,7 +305,7 @@ fn App() -> impl IntoView {
     let robots = RwSignal::new(Vec::<RobotSummary>::new());
     let robot_clock_ms = RwSignal::new(now_ms());
     let selected_robot_name = RwSignal::new(String::new());
-    let schedule_selected_task = RwSignal::new(String::from(SCHEDULE_OPTIONS[0]));
+    let schedule_selected_task = RwSignal::new(String::new());
     let scheduler_task_options = RwSignal::new(Vec::<String>::new());
     let scheduler_selected_task = RwSignal::new(String::new());
     let scheduler_target_node_id = RwSignal::new(String::new());
@@ -1287,6 +1287,7 @@ fn App() -> impl IntoView {
                                                     robot=robot
                                                     workspace=workspace
                                                     selected_robot_name=selected_robot_name
+                                                    schedule_selected_task=schedule_selected_task
                                                     scheduler_task_options=scheduler_task_options
                                                     scheduler_selected_task=scheduler_selected_task
                                                     scheduler_target_node_id=scheduler_target_node_id
@@ -1341,9 +1342,9 @@ fn App() -> impl IntoView {
                                             class:is-active=move || management_right_panel.get() == Some(RightPanel::Scheduler)
                                             on:click=open_scheduler_panel
                                             type="button"
-                                            title="Toggle scheduler panel"
+                                            title="Toggle order panel"
                                         >
-                                            "S"
+                                            "O"
                                         </button>
                                         <Show when=move || robot_has_available_tasks(&robots.get(), &selected_robot_name.get())>
                                             <button
@@ -1526,7 +1527,7 @@ fn App() -> impl IntoView {
                                     >
                                         <div class="panel-head panel-head-stack">
                                             <div>
-                                                <p class="section">"Scheduler"</p>
+                                                <p class="section">"Order"</p>
                                                 <h3>{move || {
                                                     let robot = selected_robot_name.get();
                                                     if robot.is_empty() {
@@ -1540,8 +1541,10 @@ fn App() -> impl IntoView {
                                                 {move || {
                                                     if scheduler_picking_node.get() {
                                                         "Click a node on the map or in the list.".to_string()
+                                                    } else if selected_robot_name.get().is_empty() {
+                                                        "No tasks available.".to_string()
                                                     } else {
-                                                        "Select a robot, schedule, and node.".to_string()
+                                                        "Select an order and node.".to_string()
                                                     }
                                                 }}
                                             </p>
@@ -1550,25 +1553,32 @@ fn App() -> impl IntoView {
                                             <div class="panel-card">
                                                 <div class="panel-head compact-head">
                                                     <div>
-                                                        <p class="section">"Schedule"</p>
-                                                        <h3>{move || schedule_selected_task.get()}</h3>
+                                                        <p class="section">"Order"</p>
+                                                        <h3>{move || {
+                                                            let selected = schedule_selected_task.get();
+                                                            if selected.is_empty() {
+                                                                "No tasks available".to_string()
+                                                            } else {
+                                                                selected
+                                                            }
+                                                        }}</h3>
                                                     </div>
                                                 </div>
                                                 <div class="dock-actions">
                                                     <button
                                                         class="ghost"
-                                                        class:is-armed=move || schedule_selected_task.get() == SCHEDULE_OPTIONS[0]
+                                                        class:is-armed=move || schedule_selected_task.get() == ORDER_OPTIONS[0]
                                                         disabled=move || selected_robot_name.get().is_empty()
-                                                        on:click=move |_| schedule_selected_task.set(SCHEDULE_OPTIONS[0].into())
+                                                        on:click=move |_| schedule_selected_task.set(ORDER_OPTIONS[0].into())
                                                         type="button"
                                                     >
                                                         "goto"
                                                     </button>
                                                     <button
                                                         class="ghost"
-                                                        class:is-armed=move || schedule_selected_task.get() == SCHEDULE_OPTIONS[1]
+                                                        class:is-armed=move || schedule_selected_task.get() == ORDER_OPTIONS[1]
                                                         disabled=move || selected_robot_name.get().is_empty()
-                                                        on:click=move |_| schedule_selected_task.set(SCHEDULE_OPTIONS[1].into())
+                                                        on:click=move |_| schedule_selected_task.set(ORDER_OPTIONS[1].into())
                                                         type="button"
                                                     >
                                                         "patrol"
@@ -1656,6 +1666,8 @@ fn App() -> impl IntoView {
                                                 {move || {
                                                     if scheduler_picking_node.get() {
                                                         "Click a node on the map or in the list.".to_string()
+                                                    } else if selected_robot_name.get().is_empty() {
+                                                        "No tasks available.".to_string()
                                                     } else {
                                                         "Select a robot, task, and node.".to_string()
                                                     }
@@ -1676,6 +1688,7 @@ fn App() -> impl IntoView {
                                                             <option value="">"No tasks available"</option>
                                                         }
                                                     >
+                                                        <option value="">"Select task"</option>
                                                         <For
                                                             each=move || scheduler_task_options.get()
                                                             key=|task| task.clone()
@@ -1998,6 +2011,7 @@ fn RobotFleetRow(
     robot: RobotSummary,
     workspace: RwSignal<WorkspaceJson>,
     selected_robot_name: RwSignal<String>,
+    schedule_selected_task: RwSignal<String>,
     scheduler_task_options: RwSignal<Vec<String>>,
     scheduler_selected_task: RwSignal<String>,
     scheduler_target_node_id: RwSignal<String>,
@@ -2027,6 +2041,8 @@ fn RobotFleetRow(
         let robot = robot.clone();
         move |_| {
             selected_robot_name.set(robot.name.clone());
+            schedule_selected_task.set(String::new());
+            scheduler_selected_task.set(String::new());
             scheduler_target_node_id.set(String::new());
             let ws = workspace.get();
             if let Some(point) = robot_point(&ws, &robot) {
@@ -3478,13 +3494,8 @@ async fn refresh_scheduler_tasks(
 ) {
     match scheduler_tasks_api(&robot).await {
         Ok(response) => {
-            let selected = response
-                .tasks
-                .first()
-                .cloned()
-                .unwrap_or_default();
             scheduler_task_options.set(response.tasks);
-            scheduler_selected_task.set(selected);
+            scheduler_selected_task.set(String::new());
             app_status.set(response.status);
         }
         Err(error) => {
