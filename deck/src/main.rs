@@ -7,7 +7,7 @@ use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
     Event, FileReader, HtmlAnchorElement, HtmlElement, HtmlInputElement, MouseEvent, ProgressEvent,
-    Request, RequestInit, Response,
+    Request, RequestCache, RequestInit, Response,
 };
 
 thread_local! {
@@ -227,6 +227,7 @@ struct RobotSummary {
     odom_y: Option<f64>,
     yaw_rad: Option<f64>,
     last_seen_ms: u64,
+    stale: bool,
 }
 
 impl Default for ZenohConnectionType {
@@ -2885,16 +2886,13 @@ fn now_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
-fn visible_robots(robots: &[RobotSummary], now_ms: u64) -> Vec<RobotSummary> {
-    robots
-        .iter()
-        .filter(|robot| now_ms.saturating_sub(robot.last_seen_ms) < 20_000)
-        .cloned()
-        .collect()
+fn visible_robots(robots: &[RobotSummary], _now_ms: u64) -> Vec<RobotSummary> {
+    robots.to_vec()
 }
 
 fn is_robot_stale(robot: &RobotSummary, now_ms: u64) -> bool {
-    now_ms.saturating_sub(robot.last_seen_ms) >= 5_000
+    let _ = now_ms;
+    robot.stale
 }
 
 fn robot_color(name: &str) -> String {
@@ -3035,7 +3033,9 @@ async fn robots_api() -> Result<Vec<RobotSummary>, String> {
         return Err("Browser window is unavailable.".into());
     };
 
-    let request = Request::new_with_str("/api/robots").map_err(js_error_text)?;
+    let init = RequestInit::new();
+    init.set_cache(RequestCache::NoStore);
+    let request = Request::new_with_str_and_init("/api/robots", &init).map_err(js_error_text)?;
     request
         .headers()
         .set("Accept", "application/json")
@@ -3071,6 +3071,7 @@ async fn zenoh_api_request(
 
     let init = RequestInit::new();
     init.set_method(method);
+    init.set_cache(RequestCache::NoStore);
     if let Some(body) = body.as_ref() {
         init.set_body(&JsValue::from_str(body));
     }

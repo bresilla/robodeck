@@ -83,6 +83,9 @@ pub struct RobotSummary {
     pub odom_y: Option<f64>,
     pub yaw_rad: Option<f64>,
     pub last_seen_ms: u64,
+    pub stale: bool,
+    #[serde(skip)]
+    activity_prefixes: Vec<String>,
 }
 
 impl ZenohStatusResponse {
@@ -198,7 +201,11 @@ async fn zenoh_connect(
                 "**/gnss",
                 TopicKind::Gnss,
             ));
-            let activity_watch = tokio::spawn(watch_robot_activity(state.clone(), session.clone()));
+            let activity_watch = tokio::spawn(watch_robot_activity(
+                state.clone(),
+                session.clone(),
+            ));
+            let cleanup_watch = tokio::spawn(prune_robot_activity(state.clone()));
             let response = ZenohStatusResponse {
                 state: ZenohConnectionState::Connected,
                 endpoint: endpoint.clone(),
@@ -211,7 +218,13 @@ async fn zenoh_connect(
             };
             let mut manager = state.zenoh.lock().await;
             manager.session = Some(session);
-            manager.robot_watches = vec![odom_watch, gnss_watch, gnss_root_watch, activity_watch];
+            manager.robot_watches = vec![
+                odom_watch,
+                gnss_watch,
+                gnss_root_watch,
+                activity_watch,
+                cleanup_watch,
+            ];
             manager.status = response.clone();
             (StatusCode::OK, Json(response))
         }
@@ -330,12 +343,10 @@ async fn watch_robot_topics(
         let Some(robot_name) = robot_name_from_key(key, topic_kind) else {
             continue;
         };
+        let robot_prefix = robot_prefix_from_key(key, topic_kind);
 
         let mut manager = state.zenoh.lock().await;
-        let robot = manager
-            .robots
-            .entry(robot_name.clone())
-            .or_insert_with(|| RobotSummary {
+        let robot = manager.robots.entry(robot_name.clone()).or_insert_with(|| RobotSummary {
                 name: robot_name,
                 odom_key: String::new(),
                 gnss_keys: Vec::new(),
@@ -345,9 +356,18 @@ async fn watch_robot_topics(
                 odom_y: None,
                 yaw_rad: None,
                 last_seen_ms: 0,
-            });
+                stale: false,
+                activity_prefixes: Vec::new(),
+        });
 
         robot.last_seen_ms = now_ms();
+        robot.stale = false;
+        if let Some(prefix) = robot_prefix {
+            if !robot.activity_prefixes.contains(&prefix) {
+                robot.activity_prefixes.push(prefix.clone());
+                robot.activity_prefixes.sort();
+            }
+        }
 
         match topic_kind {
             TopicKind::Odom => {
@@ -389,42 +409,63 @@ async fn watch_robot_activity(state: AppState, session: zenoh::Session) {
 
     while let Ok(sample) = subscriber.recv_async().await {
         let key = sample.key_expr().as_str().trim_matches('/');
-        let segments = key.split('/').collect::<Vec<_>>();
-        if segments.is_empty() {
+        if key.is_empty() {
             continue;
         }
 
         let mut manager = state.zenoh.lock().await;
-        let now = now_ms();
         for robot in manager.robots.values_mut() {
-            if key_matches_robot(&segments, &robot.name) {
-                robot.last_seen_ms = now;
+            if key_matches_robot(key, &robot.activity_prefixes) {
+                robot.last_seen_ms = now_ms();
+                robot.stale = false;
             }
         }
     }
 }
 
-fn key_matches_robot(segments: &[&str], robot_name: &str) -> bool {
-    let full_key = segments.join("/");
-    segments.iter().any(|segment| segment.contains(robot_name))
-        || full_key == robot_name
-        || full_key.starts_with(&format!("{robot_name}/"))
-        || full_key.contains(&format!("/{robot_name}/"))
-        || full_key.ends_with(&format!("/{robot_name}"))
+async fn prune_robot_activity(state: AppState) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        ticker.tick().await;
+        let now = now_ms();
+        let mut manager = state.zenoh.lock().await;
+        manager.robots.retain(|_, robot| {
+            let age_ms = now.saturating_sub(robot.last_seen_ms);
+            robot.stale = age_ms >= 5_000;
+            age_ms < 20_000
+        });
+    }
+}
+
+fn key_matches_robot(key: &str, activity_prefixes: &[String]) -> bool {
+    let normalized_key = key.trim_matches('/');
+    activity_prefixes.iter().any(|prefix| {
+        let normalized_prefix = prefix.trim_matches('/');
+        normalized_key == normalized_prefix
+            || normalized_key.starts_with(&format!("{normalized_prefix}/"))
+            || normalized_key.contains(&format!("/{normalized_prefix}/"))
+            || normalized_key.ends_with(&format!("/{normalized_prefix}"))
+    })
 }
 
 fn robot_name_from_key(key: &str, topic_kind: TopicKind) -> Option<String> {
     let trimmed = key.trim_matches('/');
-    let prefix = match topic_kind {
-        TopicKind::Odom => trimmed.strip_suffix("/odom")?,
-        TopicKind::Gnss => trimmed.split_once("/gnss")?.0,
-    };
+    let prefix = robot_prefix_from_key(trimmed, topic_kind)?;
     let name = prefix.rsplit('/').next()?.trim();
     if name.is_empty() {
         None
     } else {
         Some(name.to_string())
     }
+}
+
+fn robot_prefix_from_key(key: &str, topic_kind: TopicKind) -> Option<String> {
+    let trimmed = key.trim_matches('/');
+    let prefix = match topic_kind {
+        TopicKind::Odom => trimmed.strip_suffix("/odom")?,
+        TopicKind::Gnss => trimmed.split_once("/gnss")?.0,
+    };
+    Some(prefix.to_string())
 }
 
 fn now_ms() -> u64 {
