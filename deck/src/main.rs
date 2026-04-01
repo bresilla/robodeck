@@ -233,14 +233,13 @@ struct SchedulerRunRequest {
     node_name: String,
     lat: f64,
     lon: f64,
+    targets: Vec<JsonPoint>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SchedulerRunResponse {
     status: String,
 }
-
-const ORDER_OPTIONS: [&str; 2] = ["goto", "patrol"];
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 struct RobotSummary {
@@ -305,11 +304,12 @@ fn App() -> impl IntoView {
     let robots = RwSignal::new(Vec::<RobotSummary>::new());
     let robot_clock_ms = RwSignal::new(now_ms());
     let selected_robot_name = RwSignal::new(String::new());
-    let schedule_selected_task = RwSignal::new(String::new());
     let scheduler_task_options = RwSignal::new(Vec::<String>::new());
     let scheduler_selected_task = RwSignal::new(String::new());
     let scheduler_target_node_id = RwSignal::new(String::new());
     let scheduler_picking_node = RwSignal::new(false);
+    let order_targets = RwSignal::new(Vec::<JsonPoint>::new());
+    let order_picking_target = RwSignal::new(false);
     let map_host = NodeRef::<leptos::html::Div>::new();
     let map_initialized = RwSignal::new(false);
     let map_view_tick = RwSignal::new(0_u64);
@@ -344,6 +344,8 @@ fn App() -> impl IntoView {
                 active_right_panel,
                 management_right_panel,
                 scheduler_picking_node,
+                order_targets,
+                order_picking_target,
                 status,
                 raw_json,
                 marker_dragging,
@@ -416,6 +418,15 @@ fn App() -> impl IntoView {
     });
 
     Effect::new(move |_| {
+        if !order_picking_target.get() {
+            return;
+        }
+        if management_right_panel.get() != Some(RightPanel::Scheduler) {
+            order_picking_target.set(false);
+        }
+    });
+
+    Effect::new(move |_| {
         let selected_robot = selected_robot_name.get();
         let right_panel = management_right_panel.get();
         let has_tasks = robot_has_available_tasks(&robots.get(), &selected_robot);
@@ -439,6 +450,7 @@ fn App() -> impl IntoView {
         preview_mouse_point.set(None);
         zone_draft_points.set(Vec::new());
         pending_zone_parent.set(None);
+        order_picking_target.set(false);
         scene_drag.set(None);
         marker_dragging.set(false);
         clear_markers();
@@ -581,6 +593,16 @@ fn App() -> impl IntoView {
         }
     };
 
+    let arm_order_target_pick = move |_| {
+        let next = !order_picking_target.get_untracked();
+        order_picking_target.set(next);
+        if next {
+            status.set("Order target pick armed. Click the map to add targets.".into());
+        } else {
+            status.set("Order target pick cancelled.".into());
+        }
+    };
+
     let run_scheduler_task = move |_| {
         let robot = selected_robot_name.get_untracked();
         let task = scheduler_selected_task.get_untracked();
@@ -606,6 +628,7 @@ fn App() -> impl IntoView {
                 node_name: node.name,
                 lat: node.latlon.lat,
                 lon: node.latlon.lon,
+                targets: vec![node.latlon],
             },
             status,
         ));
@@ -613,29 +636,26 @@ fn App() -> impl IntoView {
 
     let run_schedule_task = move |_| {
         let robot = selected_robot_name.get_untracked();
-        let task = schedule_selected_task.get_untracked();
-        let node_id = scheduler_target_node_id.get_untracked();
-        let Some(node) = workspace.get_untracked().nodes.get(&node_id).cloned() else {
-            status.set("Select a scheduler node first.".into());
+        let targets = order_targets.get_untracked();
+        let Some(first_target) = targets.first().cloned() else {
+            status.set("Add at least one order target first.".into());
             return;
         };
         if robot.is_empty() {
             status.set("Select a robot first.".into());
             return;
         }
-        if task.is_empty() {
-            status.set("Select a schedule first.".into());
-            return;
-        }
-        status.set(format!("Sending {task} schedule to {robot}..."));
+        let task = String::from("goto");
+        status.set(format!("Sending {task} order to {robot}..."));
         spawn_local(run_scheduler_task_api(
             SchedulerRunRequest {
                 robot,
                 task,
-                node_id: node.id,
-                node_name: node.name,
-                lat: node.latlon.lat,
-                lon: node.latlon.lon,
+                node_id: String::new(),
+                node_name: String::new(),
+                lat: first_target.lat,
+                lon: first_target.lon,
+                targets,
             },
             status,
         ));
@@ -1287,10 +1307,10 @@ fn App() -> impl IntoView {
                                                     robot=robot
                                                     workspace=workspace
                                                     selected_robot_name=selected_robot_name
-                                                    schedule_selected_task=schedule_selected_task
                                                     scheduler_task_options=scheduler_task_options
                                                     scheduler_selected_task=scheduler_selected_task
                                                     scheduler_target_node_id=scheduler_target_node_id
+                                                    order_targets=order_targets
                                                     management_right_panel=management_right_panel
                                                     status=status
                                                     robot_clock_ms=robot_clock_ms
@@ -1539,12 +1559,12 @@ fn App() -> impl IntoView {
                                             </div>
                                             <p class="hint">
                                                 {move || {
-                                                    if scheduler_picking_node.get() {
-                                                        "Click a node on the map or in the list.".to_string()
+                                                    if order_picking_target.get() {
+                                                        "Click anywhere on the map to add targets.".to_string()
                                                     } else if selected_robot_name.get().is_empty() {
                                                         "No tasks available.".to_string()
                                                     } else {
-                                                        "Select an order and node.".to_string()
+                                                        "Add one or more targets, then run goto.".to_string()
                                                     }
                                                 }}
                                             </p>
@@ -1555,88 +1575,107 @@ fn App() -> impl IntoView {
                                                     <div>
                                                         <p class="section">"Order"</p>
                                                         <h3>{move || {
-                                                            let selected = schedule_selected_task.get();
-                                                            if selected.is_empty() {
+                                                            if selected_robot_name.get().is_empty() {
                                                                 "No tasks available".to_string()
                                                             } else {
-                                                                selected
+                                                                "goto".to_string()
                                                             }
                                                         }}</h3>
                                                     </div>
                                                 </div>
-                                                <div class="dock-actions">
-                                                    <button
-                                                        class="ghost"
-                                                        class:is-armed=move || schedule_selected_task.get() == ORDER_OPTIONS[0]
-                                                        disabled=move || selected_robot_name.get().is_empty()
-                                                        on:click=move |_| schedule_selected_task.set(ORDER_OPTIONS[0].into())
-                                                        type="button"
-                                                    >
-                                                        "goto"
-                                                    </button>
-                                                    <button
-                                                        class="ghost"
-                                                        class:is-armed=move || schedule_selected_task.get() == ORDER_OPTIONS[1]
-                                                        disabled=move || selected_robot_name.get().is_empty()
-                                                        on:click=move |_| schedule_selected_task.set(ORDER_OPTIONS[1].into())
-                                                        type="button"
-                                                    >
-                                                        "patrol"
-                                                    </button>
-                                                </div>
+                                                <p class="hint">"This panel sends a goto order to the selected robot."</p>
                                             </div>
                                             <div class="panel-card">
                                                 <div class="panel-head compact-head">
                                                     <div>
-                                                        <p class="section">"Target"</p>
+                                                        <p class="section">"Targets"</p>
                                                         <h3>{move || {
-                                                            let node_id = scheduler_target_node_id.get();
-                                                            if node_id.is_empty() {
-                                                                "No node selected".to_string()
+                                                            let count = order_targets.get().len();
+                                                            if count == 0 {
+                                                                "No targets".to_string()
                                                             } else {
-                                                                workspace
-                                                                    .get()
-                                                                    .nodes
-                                                                    .get(&node_id)
-                                                                    .map(|node| node.name.clone())
-                                                                    .unwrap_or(node_id)
+                                                                format!("{count} targets")
                                                             }
                                                         }}</h3>
                                                     </div>
+                                                    <button
+                                                        class="ghost"
+                                                        class:is-armed=move || order_picking_target.get()
+                                                        disabled=move || selected_robot_name.get().is_empty()
+                                                        on:click=arm_order_target_pick
+                                                        type="button"
+                                                    >
+                                                        {move || if order_picking_target.get() { "Cancel" } else { "Add Target" }}
+                                                    </button>
                                                 </div>
-                                                <p class="hint">
-                                                    {move || {
-                                                        let node_id = scheduler_target_node_id.get();
-                                                        if node_id.is_empty() {
-                                                            "Arm node picking, then click one node.".to_string()
-                                                        } else {
-                                                            workspace
-                                                                .get()
-                                                                .nodes
-                                                                .get(&node_id)
-                                                                .map(|node| point_text(&node.latlon))
-                                                                .unwrap_or_else(|| "Node no longer exists.".to_string())
-                                                        }
-                                                    }}
-                                                </p>
+                                                <div class="tree-list">
+                                                    <Show
+                                                        when=move || !order_targets.get().is_empty()
+                                                        fallback=move || view! { <p class="empty-copy">"No targets added yet."</p> }
+                                                    >
+                                                        <For
+                                                            each=move || {
+                                                                order_targets
+                                                                    .get()
+                                                                    .into_iter()
+                                                                    .enumerate()
+                                                                    .collect::<Vec<_>>()
+                                                            }
+                                                            key=|(index, _)| *index
+                                                            let:item
+                                                        >
+                                                            <div class="list-row-wrap" style="--depth:0" data-depth="0">
+                                                                <button
+                                                                    class="list-row"
+                                                                    on:click={
+                                                                        let point = item.1.clone();
+                                                                        move |_| {
+                                                                            MAP_HANDLE.with(|cell| {
+                                                                                if let Some(map) = cell.borrow().as_ref() {
+                                                                                    let _ = focus_map_point(map, &point, 18.0);
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                    type="button"
+                                                                >
+                                                                    <div class="row-main">
+                                                                        <p class="row-title">{format!("Target {}", item.0 + 1)}</p>
+                                                                        <p class="row-meta">{point_text(&item.1)}</p>
+                                                                    </div>
+                                                                    <span
+                                                                        class="row-tail-action row-tail-danger"
+                                                                        role="button"
+                                                                        tabindex="0"
+                                                                        on:click={
+                                                                            let index = item.0;
+                                                                            move |ev| {
+                                                                                ev.stop_propagation();
+                                                                                ev.prevent_default();
+                                                                                order_targets.update(|targets| {
+                                                                                    if index < targets.len() {
+                                                                                        targets.remove(index);
+                                                                                    }
+                                                                                });
+                                                                                status.set(format!("Removed target {}.", index + 1));
+                                                                            }
+                                                                        }
+                                                                    >
+                                                                        <span class="row-tail-glyph" aria-hidden="true">"x"</span>
+                                                                    </span>
+                                                                </button>
+                                                            </div>
+                                                        </For>
+                                                    </Show>
+                                                </div>
                                             </div>
                                         </div>
                                         <div class="dock-actions">
                                             <button
-                                                class="ghost"
-                                                class:is-armed=move || scheduler_picking_node.get()
-                                                disabled=move || selected_robot_name.get().is_empty()
-                                                on:click=arm_scheduler_node_pick
-                                                type="button"
-                                            >
-                                                {move || if scheduler_picking_node.get() { "Cancel Node Pick" } else { "Select Node" }}
-                                            </button>
-                                            <button
                                                 class="primary"
                                                 disabled=move || {
                                                     selected_robot_name.get().is_empty()
-                                                        || schedule_selected_task.get().is_empty()
-                                                        || scheduler_target_node_id.get().is_empty()
+                                                        || order_targets.get().is_empty()
                                                 }
                                                 on:click=run_schedule_task
                                                 type="button"
@@ -2011,10 +2050,10 @@ fn RobotFleetRow(
     robot: RobotSummary,
     workspace: RwSignal<WorkspaceJson>,
     selected_robot_name: RwSignal<String>,
-    schedule_selected_task: RwSignal<String>,
     scheduler_task_options: RwSignal<Vec<String>>,
     scheduler_selected_task: RwSignal<String>,
     scheduler_target_node_id: RwSignal<String>,
+    order_targets: RwSignal<Vec<JsonPoint>>,
     management_right_panel: RwSignal<Option<RightPanel>>,
     status: RwSignal<String>,
     robot_clock_ms: RwSignal<u64>,
@@ -2041,9 +2080,9 @@ fn RobotFleetRow(
         let robot = robot.clone();
         move |_| {
             selected_robot_name.set(robot.name.clone());
-            schedule_selected_task.set(String::new());
             scheduler_selected_task.set(String::new());
             scheduler_target_node_id.set(String::new());
+            order_targets.set(Vec::new());
             let ws = workspace.get();
             if let Some(point) = robot_point(&ws, &robot) {
                 MAP_HANDLE.with(|cell| {
@@ -4361,6 +4400,8 @@ fn bind_map_interactions(
     active_right_panel: RwSignal<Option<RightPanel>>,
     management_right_panel: RwSignal<Option<RightPanel>>,
     scheduler_picking_node: RwSignal<bool>,
+    order_targets: RwSignal<Vec<JsonPoint>>,
+    order_picking_target: RwSignal<bool>,
     status: RwSignal<String>,
     raw_json: RwSignal<String>,
     marker_dragging: RwSignal<bool>,
@@ -4614,7 +4655,11 @@ fn bind_map_interactions(
                         management_right_panel.get(),
                         Some(RightPanel::Scheduler | RightPanel::Tasks)
                     );
-            if current_app_mode != AppMode::Editor && !scheduler_pick_active {
+            let order_pick_active =
+                current_app_mode == AppMode::Management
+                    && order_picking_target.get()
+                    && management_right_panel.get() == Some(RightPanel::Scheduler);
+            if current_app_mode != AppMode::Editor && !scheduler_pick_active && !order_pick_active {
                 return;
             }
             if scene_drag.get().is_some() {
@@ -4623,6 +4668,11 @@ fn bind_map_interactions(
             let Some(point) = point_from_map_event(&event) else {
                 return;
             };
+            if order_pick_active {
+                order_targets.update(|targets| targets.push(point.clone()));
+                status.set(format!("Added order target {}.", point_text(&point)));
+                return;
+            }
             if mode.get() == Mode::PlaceRef {
                 set_reference_point(workspace, mode, status, raw_json, point);
                 return;
@@ -4964,9 +5014,6 @@ fn nearest_zone_vertex_index(map: &JsValue, zone: &ZoneJson, point: &JsonPoint, 
 }
 
 fn enable_middle_pan(map: &JsValue) -> Result<(), JsValue> {
-    if let Ok(drag_pan) = js_sys::Reflect::get(map, &JsValue::from_str("dragPan")) {
-        let _ = call_method0(&drag_pan, "disable");
-    }
     let canvas_container: HtmlElement = call_method0(map, "getCanvasContainer")?.dyn_into()?;
     let canvas: HtmlElement = call_method0(map, "getCanvas")?.dyn_into()?;
     let state = std::rc::Rc::new(RefCell::new(None::<(i32, i32)>));

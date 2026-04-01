@@ -79,6 +79,12 @@ pub struct SchedulerTasksResponse {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TaskTarget {
+    pub lat: f64,
+    pub lon: f64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchedulerRunRequest {
     pub robot: String,
@@ -87,6 +93,8 @@ pub struct SchedulerRunRequest {
     pub node_name: String,
     pub lat: f64,
     pub lon: f64,
+    #[serde(default)]
+    pub targets: Vec<TaskTarget>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -347,11 +355,11 @@ async fn zenoh_run_task(
             }),
         );
     }
-    if request.node_id.trim().is_empty() {
+    if request.node_id.trim().is_empty() && request.targets.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(SchedulerRunResponse {
-                status: "Select a target node first.".into(),
+                status: "Select at least one target first.".into(),
             }),
         );
     }
@@ -372,10 +380,20 @@ async fn zenoh_run_task(
         Ok(_) => (
             StatusCode::OK,
             Json(SchedulerRunResponse {
-                status: format!(
-                    "Sent {} to {} for node {}.",
-                    request.task, robot, request.node_name
-                ),
+                status: if request.node_name.trim().is_empty() {
+                    format!(
+                        "Sent {} to {} with {} target{}.",
+                        request.task,
+                        robot,
+                        request.targets.len(),
+                        if request.targets.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "Sent {} to {} for node {}.",
+                        request.task, robot, request.node_name
+                    )
+                },
             }),
         ),
         Err(error) => (
