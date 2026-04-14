@@ -157,8 +157,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = APP_ADDR.parse()?;
     let listener = TcpListener::bind(addr).await?;
 
-    println!("uimap: serving UI and zenoh api on http://127.0.0.1:38080");
-    println!("uimap: open http://127.0.0.1:38080 in your browser");
+    println!("uimap: serving UI and zenoh api on http://0.0.0.0:38080 (all interfaces)");
+    println!("uimap: open http://<this-host-ip>:38080 in your browser");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state))

@@ -154,6 +154,7 @@ enum RightPanel {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppMode {
+    Input,
     Editor,
     Management,
 }
@@ -365,10 +366,18 @@ fn App() -> impl IntoView {
         let hovered_edge = hovered_edge_id.get();
         let preview_point = preview_mouse_point.get();
         let zone_draft = zone_draft_points.get();
+        let order_target_points = order_targets.get();
         let dragging = marker_dragging.get();
         let current_app_mode = app_mode.get();
         let now_ms = robot_clock_ms.get();
-        let robot_state = visible_robots(&robots.get(), now_ms);
+        let robots_now = robots.get();
+        let robot_state = visible_robots(&robots_now, now_ms);
+        let selected_robot = selected_robot_name.get();
+        let order_target_color = robots_now
+            .iter()
+            .find(|robot| robot.name == selected_robot)
+            .map(|robot| robot.color.clone())
+            .unwrap_or_else(|| String::from("#8fd2e4"));
         let _ = map_view_tick.get();
         MAP_HANDLE.with(|cell| {
             if let Some(map) = cell.borrow().as_ref() {
@@ -383,6 +392,8 @@ fn App() -> impl IntoView {
                         &hovered_edge,
                         preview_point.as_ref(),
                         &zone_draft,
+                        &order_target_points,
+                        &order_target_color,
                     );
                     if current_app_mode == AppMode::Editor && !dragging {
                         let _ = render_markers(
@@ -442,7 +453,8 @@ fn App() -> impl IntoView {
     });
 
     Effect::new(move |_| {
-        if app_mode.get() == AppMode::Editor {
+        let current = app_mode.get();
+        if current == AppMode::Editor || current == AppMode::Input {
             return;
         }
         mode.set(Mode::Inspect);
@@ -496,6 +508,11 @@ fn App() -> impl IntoView {
         });
         selection.set(Selection::Workspace);
         update_workspace("Removed edge.", false);
+    };
+
+    let switch_to_input = move |_| {
+        app_mode.set(AppMode::Input);
+        status.set("Input mode.".into());
     };
 
     let switch_to_editor = move |_| {
@@ -820,29 +837,7 @@ fn App() -> impl IntoView {
                         </div>
 
                         <div class="floating left-stack">
-                            <Show
-                                when=move || app_mode.get() == AppMode::Editor
-                                fallback=move || view! {
-                                    <button
-                                        class="panel-toggle"
-                                        class:is-active=move || management_left_panel.get() == Some(LeftPanel::Zenoh)
-                                        on:click=move |_| toggle_management_left_panel(LeftPanel::Zenoh)
-                                        type="button"
-                                        title="Toggle Zenoh panel"
-                                    >
-                                        "Z"
-                                    </button>
-                                    <button
-                                        class="panel-toggle"
-                                        class:is-active=move || management_left_panel.get() == Some(LeftPanel::Robots)
-                                        on:click=move |_| toggle_management_left_panel(LeftPanel::Robots)
-                                        type="button"
-                                        title="Toggle robots panel"
-                                    >
-                                        "R"
-                                    </button>
-                                }
-                            >
+                            <Show when=move || app_mode.get() == AppMode::Input>
                                 <button
                                     class="panel-toggle"
                                     class:is-active=move || active_left_panel.get() == Some(LeftPanel::Reference)
@@ -852,6 +847,8 @@ fn App() -> impl IntoView {
                                 >
                                     "R"
                                 </button>
+                            </Show>
+                            <Show when=move || app_mode.get() == AppMode::Editor>
                                 <button
                                     class="panel-toggle"
                                     class:is-active=move || active_left_panel.get() == Some(LeftPanel::Zones)
@@ -871,10 +868,30 @@ fn App() -> impl IntoView {
                                     "G"
                                 </button>
                             </Show>
+                            <Show when=move || app_mode.get() == AppMode::Management>
+                                <button
+                                    class="panel-toggle"
+                                    class:is-active=move || management_left_panel.get() == Some(LeftPanel::Zenoh)
+                                    on:click=move |_| toggle_management_left_panel(LeftPanel::Zenoh)
+                                    type="button"
+                                    title="Toggle Zenoh panel"
+                                >
+                                    "Z"
+                                </button>
+                                <button
+                                    class="panel-toggle"
+                                    class:is-active=move || management_left_panel.get() == Some(LeftPanel::Robots)
+                                    on:click=move |_| toggle_management_left_panel(LeftPanel::Robots)
+                                    type="button"
+                                    title="Toggle robots panel"
+                                >
+                                    "R"
+                                </button>
+                            </Show>
                         </div>
 
                         <div class="floating left-panels">
-                            <Show when=move || app_mode.get() == AppMode::Editor>
+                            <Show when=move || app_mode.get() == AppMode::Input>
                             <section
                                 class="card floating-panel left-panel-card"
                                 class:is-hidden=move || active_left_panel.get() != Some(LeftPanel::Reference)
@@ -940,7 +957,9 @@ fn App() -> impl IntoView {
                                 </div>
                                 <p class="hint">{move || status.get()}</p>
                             </section>
+                            </Show>
 
+                            <Show when=move || app_mode.get() == AppMode::Editor>
                             <section
                                 class="card floating-panel left-panel-card"
                                 class:is-hidden=move || active_left_panel.get() != Some(LeftPanel::Zones)
@@ -1325,6 +1344,15 @@ fn App() -> impl IntoView {
                         <div class="floating top-mode-switch">
                             <button
                                 class="panel-toggle"
+                                class:is-active=move || app_mode.get() == AppMode::Input
+                                on:click=switch_to_input
+                                type="button"
+                                title="Input"
+                            >
+                                "I"
+                            </button>
+                            <button
+                                class="panel-toggle"
                                 class:is-active=move || app_mode.get() == AppMode::Editor
                                 on:click=switch_to_editor
                                 type="button"
@@ -1345,40 +1373,18 @@ fn App() -> impl IntoView {
 
                         <div class="floating right-panel-shell">
                             <div class="right-stack">
-                                <Show
-                                    when=move || app_mode.get() == AppMode::Editor
-                                fallback=move || view! {
-                                        <button
-                                            class="panel-toggle"
-                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Details)
-                                            on:click=move |_| toggle_management_right_panel(RightPanel::Details)
-                                            type="button"
-                                            title="Toggle inspector panel"
-                                        >
-                                            "I"
-                                        </button>
-                                        <button
-                                            class="panel-toggle"
-                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Scheduler)
-                                            on:click=open_scheduler_panel
-                                            type="button"
-                                            title="Toggle order panel"
-                                        >
-                                            "O"
-                                        </button>
-                                        <Show when=move || robot_has_available_tasks(&robots.get(), &selected_robot_name.get())>
-                                            <button
-                                                class="panel-toggle"
-                                                class:is-active=move || management_right_panel.get() == Some(RightPanel::Tasks)
-                                                on:click=open_tasks_panel
-                                                type="button"
-                                                title="Toggle tasks panel"
-                                            >
-                                                "T"
-                                            </button>
-                                        </Show>
-                                    }
-                                >
+                                <Show when=move || app_mode.get() == AppMode::Input>
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || active_right_panel.get() == Some(RightPanel::Files)
+                                        on:click=move |_| toggle_right_panel(RightPanel::Files)
+                                        type="button"
+                                        title="Toggle file input panel"
+                                    >
+                                        "F"
+                                    </button>
+                                </Show>
+                                <Show when=move || app_mode.get() == AppMode::Editor>
                                     <button
                                         class="panel-toggle"
                                         class:is-active=move || active_right_panel.get() == Some(RightPanel::Details)
@@ -1402,13 +1408,62 @@ fn App() -> impl IntoView {
                                         class:is-active=move || active_right_panel.get() == Some(RightPanel::Files)
                                         on:click=move |_| toggle_right_panel(RightPanel::Files)
                                         type="button"
-                                        title="Toggle files panel"
+                                        title="Toggle export panel"
                                     >
-                                        "F"
+                                        "E"
                                     </button>
+                                </Show>
+                                <Show when=move || app_mode.get() == AppMode::Management>
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || management_right_panel.get() == Some(RightPanel::Details)
+                                        on:click=move |_| toggle_management_right_panel(RightPanel::Details)
+                                        type="button"
+                                        title="Toggle inspector panel"
+                                    >
+                                        "I"
+                                    </button>
+                                    <button
+                                        class="panel-toggle"
+                                        class:is-active=move || management_right_panel.get() == Some(RightPanel::Scheduler)
+                                        on:click=open_scheduler_panel
+                                        type="button"
+                                        title="Toggle order panel"
+                                    >
+                                        "O"
+                                    </button>
+                                    <Show when=move || robot_has_available_tasks(&robots.get(), &selected_robot_name.get())>
+                                        <button
+                                            class="panel-toggle"
+                                            class:is-active=move || management_right_panel.get() == Some(RightPanel::Tasks)
+                                            on:click=open_tasks_panel
+                                            type="button"
+                                            title="Toggle tasks panel"
+                                        >
+                                            "T"
+                                        </button>
+                                    </Show>
                                 </Show>
                             </div>
                             <div class="right-panels">
+                                <Show when=move || app_mode.get() == AppMode::Input>
+                                    <section
+                                        class="card floating-panel right-panel-card"
+                                        class:is-hidden=move || active_right_panel.get() != Some(RightPanel::Files)
+                                    >
+                                        <div class="panel-head panel-head-stack">
+                                            <div>
+                                                <p class="section">"Input"</p>
+                                                <h3>"Load Workspace"</h3>
+                                            </div>
+                                            <p class="hint">{move || status.get()}</p>
+                                        </div>
+                                        <div class="dock-actions">
+                                            <button class="ghost" on:click=new_workspace type="button">"New"</button>
+                                            <button class="primary" on:click=open_workspace type="button">"Open"</button>
+                                        </div>
+                                    </section>
+                                </Show>
                                 <Show when=move || app_mode.get() == AppMode::Editor>
                                 <section
                                     class="card floating-panel right-panel-card"
@@ -1429,7 +1484,7 @@ fn App() -> impl IntoView {
                                 >
                                     <div class="panel-head panel-head-stack">
                                         <div>
-                                            <p class="section">"Workspace"</p>
+                                            <p class="section">"Export"</p>
                                             <h3>{move || workspace.get().name}</h3>
                                         </div>
                                         <p class="hint">{move || status.get()}</p>
@@ -1510,8 +1565,6 @@ fn App() -> impl IntoView {
                                         </div>
                                     </div>
                                     <div class="dock-actions">
-                                        <button class="ghost" on:click=new_workspace type="button">"New"</button>
-                                        <button class="ghost" on:click=open_workspace type="button">"Open"</button>
                                         <button class="primary" on:click=save_workspace type="button">"Save"</button>
                                         <button class="ghost" on:click=locate_me_action type="button">"Locate Me"</button>
                                     </div>
@@ -4659,7 +4712,14 @@ fn bind_map_interactions(
                 current_app_mode == AppMode::Management
                     && order_picking_target.get()
                     && management_right_panel.get() == Some(RightPanel::Scheduler);
-            if current_app_mode != AppMode::Editor && !scheduler_pick_active && !order_pick_active {
+            if current_app_mode != AppMode::Editor
+                && current_app_mode != AppMode::Input
+                && !scheduler_pick_active
+                && !order_pick_active
+            {
+                return;
+            }
+            if current_app_mode == AppMode::Input && mode.get() != Mode::PlaceRef {
                 return;
             }
             if scene_drag.get().is_some() {
@@ -5096,6 +5156,7 @@ fn ensure_map_layers(map: &JsValue) -> Result<(), JsValue> {
         add_geojson_source(map, "edge_arrows")?;
         add_geojson_source(map, "edge_preview")?;
         add_geojson_source(map, "reference")?;
+        add_geojson_source(map, "order_targets")?;
 
         add_layer(map, zone_fill_layer()?)?;
         add_layer(map, zone_line_layer()?)?;
@@ -5114,6 +5175,8 @@ fn ensure_map_layers(map: &JsValue) -> Result<(), JsValue> {
         add_layer(map, node_circle_layer()?)?;
         add_layer(map, node_hit_layer()?)?;
         add_layer(map, reference_circle_layer()?)?;
+        add_layer(map, order_targets_line_layer()?)?;
+        add_layer(map, order_targets_point_layer()?)?;
     }
     Ok(())
 }
@@ -5134,6 +5197,8 @@ fn update_map_sources(
     hovered_edge_id: &str,
     preview_mouse_point: Option<&JsonPoint>,
     zone_draft_points: &[JsonPoint],
+    order_targets: &[JsonPoint],
+    order_target_color: &str,
 ) -> Result<(), JsValue> {
     set_source_data(map, "zones", zones_geojson(workspace, selection)?)?;
     set_source_data(map, "zone_draft", zone_draft_geojson(zone_draft_points)?)?;
@@ -5151,6 +5216,11 @@ fn update_map_sources(
         edge_preview_geojson(workspace, edge_source_id, preview_mouse_point)?,
     )?;
     set_source_data(map, "reference", reference_geojson(workspace)?)?;
+    set_source_data(
+        map,
+        "order_targets",
+        order_targets_geojson(order_targets, order_target_color)?,
+    )?;
     call_method0(map, "triggerRepaint")?;
     Ok(())
 }
@@ -5337,6 +5407,8 @@ fn render_markers(
                         &hovered_edge_id.get(),
                         None,
                         &[],
+                        &[],
+                        "#8fd2e4",
                     );
                 }
             })?;
@@ -5405,6 +5477,8 @@ fn render_markers(
                             &hovered_edge_id.get(),
                             None,
                             &[],
+                            &[],
+                            "#8fd2e4",
                         );
                     }
                 })?;
@@ -5470,6 +5544,8 @@ fn render_markers(
                         &hovered_edge_id.get(),
                         None,
                         &[],
+                        &[],
+                        "#8fd2e4",
                     );
                 }
             })?;
@@ -5624,6 +5700,38 @@ fn zone_draft_geojson(points: &[JsonPoint]) -> Result<JsValue, JsValue> {
             "properties": {
                 "kind": "point",
                 "index": index,
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [point.lon, point.lat]
+            }
+        }));
+    }
+    json_to_js(serde_json::json!({ "type": "FeatureCollection", "features": features }))
+}
+
+fn order_targets_geojson(points: &[JsonPoint], color: &str) -> Result<JsValue, JsValue> {
+    let mut features = Vec::new();
+    if points.len() >= 2 {
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "properties": {
+                "kind": "line",
+                "color": color,
+            },
+            "geometry": {
+                "type": "LineString",
+                "coordinates": points.iter().map(|p| vec![p.lon, p.lat]).collect::<Vec<_>>()
+            }
+        }));
+    }
+    for (index, point) in points.iter().enumerate() {
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "properties": {
+                "kind": "point",
+                "index": index,
+                "color": color,
             },
             "geometry": {
                 "type": "Point",
@@ -6045,6 +6153,36 @@ fn reference_circle_layer() -> Result<JsValue, JsValue> {
             "circle-radius": 8,
             "circle-color": "#d94141",
             "circle-stroke-color": "#fff1f1",
+            "circle-stroke-width": 2
+        }
+    }))
+}
+
+fn order_targets_line_layer() -> Result<JsValue, JsValue> {
+    json_to_js(serde_json::json!({
+        "id": "order-targets-line",
+        "type": "line",
+        "source": "order_targets",
+        "filter": ["==", ["geometry-type"], "LineString"],
+        "paint": {
+            "line-color": ["coalesce", ["get", "color"], "#8fd2e4"],
+            "line-width": 3,
+            "line-opacity": 0.92,
+            "line-dasharray": [1.0, 0.9]
+        }
+    }))
+}
+
+fn order_targets_point_layer() -> Result<JsValue, JsValue> {
+    json_to_js(serde_json::json!({
+        "id": "order-targets-point",
+        "type": "circle",
+        "source": "order_targets",
+        "filter": ["==", ["geometry-type"], "Point"],
+        "paint": {
+            "circle-radius": 6,
+            "circle-color": ["coalesce", ["get", "color"], "#8fd2e4"],
+            "circle-stroke-color": "#f6f0e7",
             "circle-stroke-width": 2
         }
     }))
